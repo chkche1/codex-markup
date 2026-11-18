@@ -1,0 +1,48 @@
+{
+  "name": "codex-markup",
+  "version": "1.0.0",
+  "description": "Claude Artifacts-style HTML preview and inline commenting server + MCP integration for OpenAI Codex",
+  "type": "module",
+  "bin": {
+    "codex-markup": "./bin/codex-markup.js",
+    "codex-inline-review": "./bin/codex-inline-review.js"
+  },
+  "scripts": {
+    "start": "node --no-warnings src/cli.ts",
+    "serve": "node --no-warnings src/cli.ts serve",
+    "mcp": "node --no-warnings src/cli.ts mcp",
+    "demo": "node --no-warnings src/cli.ts serve examples/demo.html",
+    "test": "node --no-warnings --test test/eval.test.ts",
+    "install-codex": "node --no-warnings src/cli.ts install"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "keywords": [
+    "codex",
+    "openai",
+    "mcp",
+    "inline-comments",
+    "html-preview",
+    "artifacts"
+  ],
+  "author": "Kent Chen <chkche1@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chkche1/codex-markup.git"
+  },
+  "homepage": "https://github.com/chkche1/codex-markup#readme",
+  "bugs": {
+    "url": "https://github.com/chkche1/codex-markup/issues"
+  },
+  "files": [
+    "bin",
+    "src",
+    "skills",
+    "examples/demo.html",
+    "README.md",
+    "AGENTS.md",
+    "LICENSE"
+  ]
+}
