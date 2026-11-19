@@ -1,5 +1,17 @@
 # AGENTS.md — Inline HTML Review Integration for Codex
 
+## Installing `codex-markup` for a User
+
+If asked to install this repository for Codex, run this single idempotent, self-verifying command (requires Node.js `>=22.6.0`, zero npm dependencies — do **not** run `npm install` or `npm run demo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chkche1/codex-markup/main/install.sh | bash
+```
+
+*(Or from inside an existing checkout: `npm run install-codex`. Verify anytime with `npm run doctor`.)*
+
+---
+
 Whenever you create or update an HTML artifact/page for the user, or when the user asks to review an HTML file or address inline comments:
 
 1. **Open HTML Preview with Inline Commenting**:
@@ -32,7 +44,9 @@ Whenever you create or update an HTML artifact/page for the user, or when the us
 
 | Path | Responsibility |
 | :--- | :--- |
-| `src/cli.ts` | CLI entry point (`serve`, `mcp`, `wait`, `comments` / `list`, `add-comment`, `reply`, `resolve`, `restart`, `install`, `setup`) and Codex Desktop/CLI installer (`installForCodex`). |
+| `src/cli.ts` | CLI entry point (`serve`, `mcp`, `wait`, `comments` / `list`, `add-comment`, `reply`, `resolve`, `restart`, `install`, `doctor`, `uninstall`, `setup`). |
+| `src/install.ts` | Codex Desktop/CLI installer (`installForCodex`), ephemeral checkout relocation (`copyRuntimeToDir`), verification (`runDoctor` + MCP smoke test), and clean removal (`uninstallFromCodex`). |
+| `install.sh` | Fast standalone bootstrapper: locates Node `>=22.6.0`, clones/updates `~/.codex/tools/codex-markup` (with tarball fallback), and runs `install`. |
 | `src/server.ts` | `InlineReviewServer` HTTP + Server-Sent Events (SSE) server, static relative asset serving, `<script>` widget injection (`injectReviewWidget`), `fs.watch` live-reload watchers, and background `codex exec --ephemeral` dispatch (`runBackgroundCodex`). |
 | `src/widget.ts` | Client-side review overlay (`getWidgetScript`) mounted inside an open Shadow DOM (`#codex-inline-review-root`) with text selection highlighting, DOM element picker, dark floating popovers (`openComposerPopover`, `openThreadPopover`), Web Speech dictation (`🎙️`), collapsible right-hand thread drawer (`💬 Threads`), and SSE synchronization. |
 | `src/mcp.ts` | Zero-dependency JSON-RPC 2.0 MCP stdio server (`startMcpServer`) supporting both newline-delimited and `Content-Length` framing, exposing `open_html_review`, `wait_for_review`, `get_inline_comments`, `reply_to_comment`, and `resolve_comment`. |

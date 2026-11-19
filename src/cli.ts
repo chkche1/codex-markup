@@ -11,6 +11,7 @@ import {
   type SandboxCapabilities,
 } from './server.ts';
 import { startMcpServer } from './mcp.ts';
+import { installForCodex, runDoctor, uninstallFromCodex } from './install.ts';
 import {
   formatReviewForCodex,
   createThread,
@@ -70,11 +71,17 @@ COMMANDS:
   resolve <file.html> <id>        Mark a comment thread as resolved (--reopen to reopen)
   restart [file.html]             Restart the local review server (and trigger review if file given)
   install                         Configure ~/.codex/config.toml, skill, and AGENTS.md for Codex Desktop & CLI
+  doctor                          Verify Node.js version, Codex config, skill, and MCP server handshake
+  uninstall                       Remove Codex MCP config, skill, global instructions, and copied runtime
   setup                           Print Codex MCP & Skill configuration instructions
 
 OPTIONS:
   -p, --port <number>             Port for local review server (default: ${DEFAULT_PORT})
   --sandbox <mode>                Background codex exec mode: full-access (default when unsandboxed) | workspace-write
+  --codex-home <dir>              Custom Codex configuration directory (default: ~/.codex)
+  --copy                          Copy runtime to <codex-home>/tools/codex-markup on install
+  --install-dir <dir>             Explicit runtime destination directory on install (implies --copy)
+  --no-verify                     Skip post-install MCP verification in 'install'
   --no-open                       Do not automatically open the browser on 'serve'
   -h, --help                      Show this help message
 
@@ -102,87 +109,6 @@ function printSandboxStatus(caps?: SandboxCapabilities) {
       `🔒 Background Codex mode: workspace-write (root: ${caps.workspaceRoot}; pass --sandbox full-access for unrestricted access)`
     );
   }
-}
-
-function installForCodex(customCodexHome?: string) {
-  const codexHome = customCodexHome
-    ? path.resolve(customCodexHome)
-    : process.env.CODEX_HOME
-      ? path.resolve(process.env.CODEX_HOME)
-      : path.join(os.homedir(), '.codex');
-
-  const repoRoot = path.resolve(import.meta.dirname || '.', '..');
-  const cliEntry = path.join(repoRoot, 'src', 'cli.ts');
-  const nodeBin = fs.existsSync('/opt/homebrew/bin/node')
-    ? '/opt/homebrew/bin/node'
-    : process.execPath;
-
-  fs.mkdirSync(codexHome, { recursive: true });
-
-  // 1. Configure ~/.codex/config.toml
-  const configPath = path.join(codexHome, 'config.toml');
-  const tomlBlock = [
-    `[mcp_servers.inline-review]`,
-    `command = ${JSON.stringify(nodeBin)}`,
-    `args = ["--no-warnings", ${JSON.stringify(cliEntry)}, "mcp"]`,
-  ].join('\n');
-
-  let existingConfig = '';
-  if (fs.existsSync(configPath)) {
-    existingConfig = fs.readFileSync(configPath, 'utf8');
-  }
-
-  const sectionRegex = /\[mcp_servers\.inline-review\][\s\S]*?(?=\n\[|\s*$)/;
-  let updatedConfig: string;
-  if (sectionRegex.test(existingConfig)) {
-    updatedConfig = existingConfig.replace(sectionRegex, tomlBlock);
-  } else {
-    const trimmed = existingConfig.trimEnd();
-    updatedConfig = trimmed ? `${trimmed}\n\n${tomlBlock}\n` : `${tomlBlock}\n`;
-  }
-  fs.writeFileSync(configPath, updatedConfig, 'utf8');
-  console.log(`✓ Configured MCP server [mcp_servers.inline-review] in ${configPath}`);
-
-  // 2. Install Skill into ~/.codex/skills/inline-html-review/SKILL.md
-  const sourceSkillPath = path.join(repoRoot, 'skills', 'inline-html-review', 'SKILL.md');
-  const targetSkillDir = path.join(codexHome, 'skills', 'inline-html-review');
-  const targetSkillPath = path.join(targetSkillDir, 'SKILL.md');
-  fs.mkdirSync(targetSkillDir, { recursive: true });
-  const rawSkill = fs.readFileSync(sourceSkillPath, 'utf8');
-  const resolvedSkill = rawSkill
-    .replaceAll('<path-to-codex-markup>/src/cli.ts', cliEntry)
-    .replaceAll('<path-to-codex-inline-review>/src/cli.ts', cliEntry);
-  fs.writeFileSync(targetSkillPath, resolvedSkill, 'utf8');
-  console.log(`✓ Installed Codex skill to ${targetSkillPath}`);
-
-  // 3. Add global instruction block to ~/.codex/AGENTS.md
-  const agentsPath = path.join(codexHome, 'AGENTS.md');
-  const markerStart = '<!-- BEGIN CODEX-INLINE-REVIEW -->';
-  const markerEnd = '<!-- END CODEX-INLINE-REVIEW -->';
-  const agentsSnippet = [
-    markerStart,
-    `## Inline HTML Preview & Commenting (\`inline-review\` MCP)`,
-    `Whenever you generate or update an HTML file/artifact for the user, or when the user asks to preview an HTML page or address inline comments:`,
-    `1. Call the \`open_html_review\` MCP tool with \`file_path\` to open the live browser preview with inline text & DOM commenting.`,
-    `2. Call \`wait_for_review\` (or pass \`wait_for_submission: true\` to \`open_html_review\`) to wait for the user to click **"🚀 Submit to Codex"** in the browser, or call \`get_inline_comments\` when asked to check comments.`,
-    `3. Edit the HTML file to address each comment and call \`reply_to_comment\` with \`comment_id\` (e.g. \`c-1\`), your explanation/answer, and \`status: "resolved"\` (or \`"answered"\` for questions).`,
-    markerEnd,
-  ].join('\n');
-
-  let existingAgents = '';
-  if (fs.existsSync(agentsPath)) {
-    existingAgents = fs.readFileSync(agentsPath, 'utf8');
-  }
-  const markerRegex = new RegExp(`${markerStart}[\\s\\S]*?${markerEnd}`, 'm');
-  let updatedAgents: string;
-  if (markerRegex.test(existingAgents)) {
-    updatedAgents = existingAgents.replace(markerRegex, agentsSnippet);
-  } else {
-    const trimmed = existingAgents.trimEnd();
-    updatedAgents = trimmed ? `${trimmed}\n\n${agentsSnippet}\n` : `${agentsSnippet}\n`;
-  }
-  fs.writeFileSync(agentsPath, updatedAgents, 'utf8');
-  console.log(`✓ Updated global instructions in ${agentsPath}`);
 }
 
 function printSetup() {
@@ -238,7 +164,31 @@ async function main() {
 
   if (cmd === 'install') {
     const customDir = typeof flags['codex-home'] === 'string' ? flags['codex-home'] : undefined;
-    installForCodex(customDir);
+    const installDir = typeof flags['install-dir'] === 'string' ? flags['install-dir'] : undefined;
+    await installForCodex({
+      codexHome: customDir,
+      copy: Boolean(flags.copy),
+      installDir,
+      skipVerify: Boolean(flags['no-verify']),
+    });
+    return;
+  }
+
+  if (cmd === 'doctor') {
+    const customDir = typeof flags['codex-home'] === 'string' ? flags['codex-home'] : undefined;
+    const report = await runDoctor({ codexHome: customDir });
+    if (!report.ok) {
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (cmd === 'uninstall') {
+    const customDir = typeof flags['codex-home'] === 'string' ? flags['codex-home'] : undefined;
+    uninstallFromCodex({
+      codexHome: customDir,
+      keepRuntime: Boolean(flags['keep-runtime']),
+    });
     return;
   }
 

@@ -13,7 +13,9 @@
     "mcp": "node --no-warnings src/cli.ts mcp",
     "demo": "node --no-warnings src/cli.ts serve examples/demo.html",
     "test": "node --no-warnings --test test/eval.test.ts",
-    "install-codex": "node --no-warnings src/cli.ts install"
+    "install-codex": "node --no-warnings src/cli.ts install",
+    "doctor": "node --no-warnings src/cli.ts doctor",
+    "uninstall-codex": "node --no-warnings src/cli.ts uninstall"
   },
   "engines": {
     "node": ">=22.6.0"
@@ -41,6 +43,7 @@
     "src",
     "skills",
     "examples/demo.html",
+    "install.sh",
     "README.md",
     "AGENTS.md",
     "LICENSE"

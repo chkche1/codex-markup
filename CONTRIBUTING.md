@@ -8,7 +8,9 @@ All source files live in `src/` and run directly with Node.js without a compile/
 
 | Path | Responsibility |
 | :--- | :--- |
-| [`src/cli.ts`](src/cli.ts) | CLI entry point (`serve`, `mcp`, `wait`, `comments` / `list`, `add-comment`, `reply`, `resolve`, `restart`, `install`, `setup`) and Codex Desktop/CLI installer (`installForCodex`). |
+| [`src/cli.ts`](src/cli.ts) | CLI entry point (`serve`, `mcp`, `wait`, `comments` / `list`, `add-comment`, `reply`, `resolve`, `restart`, `install`, `doctor`, `uninstall`, `setup`). |
+| [`src/install.ts`](src/install.ts) | Codex Desktop/CLI installer (`installForCodex`), ephemeral checkout relocation (`copyRuntimeToDir`), verification (`runDoctor`), and clean removal (`uninstallFromCodex`). |
+| [`install.sh`](install.sh) | Standalone one-line bootstrapper locating Node `>=22.6.0` and installing to `~/.codex/tools/codex-markup`. |
 | [`src/server.ts`](src/server.ts) | `InlineReviewServer` HTTP + SSE server, relative static asset serving, widget injection (`injectReviewWidget`), `fs.watch` live reload, and background `codex exec --ephemeral` dispatch (`runBackgroundCodex`). |
 | [`src/widget.ts`](src/widget.ts) | Client-side overlay (`getWidgetScript`) mounted in `#codex-inline-review-root`, including text highlighting, element picker, dark floating popovers (`openComposerPopover`, `openThreadPopover`), Web Speech dictation (`🎙️`), thread drawer (`💬 Threads`), and SSE sync. |
 | [`src/mcp.ts`](src/mcp.ts) | Zero-dependency JSON-RPC 2.0 MCP stdio server (`startMcpServer`) supporting newline-delimited and `Content-Length` framing (`open_html_review`, `wait_for_review`, `get_inline_comments`, `reply_to_comment`, `resolve_comment`). |

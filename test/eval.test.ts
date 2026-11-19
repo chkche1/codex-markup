@@ -28,6 +28,7 @@ import {
   resolveWorkspaceRoot,
 } from '../src/server.ts';
 import { getWidgetScript } from '../src/widget.ts';
+import { isEphemeralCheckoutPath, isSupportedNodeVersion } from '../src/install.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -1192,11 +1193,17 @@ describe('Suite 4 — CLI End-to-End Evaluation', () => {
     const agentsPath = path.join(codexHome, 'AGENTS.md');
     const skillPath = path.join(codexHome, 'skills', 'inline-html-review', 'SKILL.md');
 
-    // Seed pre-existing unrelated content to verify non-destructive merge
-    fs.writeFileSync(configPath, 'model = "gpt-5"\n', 'utf8');
+    // Seed pre-existing unrelated content and a quoted [mcp_servers."inline-review"] block to verify non-destructive merge
+    fs.writeFileSync(
+      configPath,
+      'model = "gpt-5"\n\n[mcp_servers."inline-review"]\ncommand = "old-node"\nargs = ["old.ts"]\n',
+      'utf8'
+    );
     fs.writeFileSync(agentsPath, '# Custom User Instructions\nKeep diffs minimal.\n', 'utf8');
 
-    await runCli(['install', '--codex-home', codexHome]);
+    const firstInstall = await runCli(['install', '--codex-home', codexHome]);
+    assert.match(firstInstall.stdout, /✓ Verified MCP server \(5 tools:/);
+    assert.match(firstInstall.stdout, /STATUS: OK/);
 
     const configAfterFirst = fs.readFileSync(configPath, 'utf8');
     const agentsAfterFirst = fs.readFileSync(agentsPath, 'utf8');
@@ -1204,6 +1211,9 @@ describe('Suite 4 — CLI End-to-End Evaluation', () => {
 
     assert.match(configAfterFirst, /^model = "gpt-5"/);
     assert.match(configAfterFirst, /\[mcp_servers\.inline-review\]/);
+    assert.equal(configAfterFirst.includes('[mcp_servers."inline-review"]'), false);
+    assert.equal(configAfterFirst.includes('old-node'), false);
+    assert.ok(configAfterFirst.includes(JSON.stringify(process.execPath)));
     assert.ok(configAfterFirst.includes(CLI_ENTRY));
 
     assert.equal(skillAfterFirst.includes('<path-to-codex-markup>/src/cli.ts'), false);
@@ -1287,5 +1297,97 @@ describe('Suite 4 — CLI End-to-End Evaluation', () => {
     assert.match(listAll.stdout, /Inline Comments \(2 total\)/);
     const listOpen3 = await runCli(['comments', htmlFile, '--status', 'open']);
     assert.match(listOpen3.stdout, /Inline Comments \(2 open\)/);
+  });
+
+  it('supports --copy runtime relocation, doctor verification, and clean uninstall round-trip', async () => {
+    assert.equal(isSupportedNodeVersion('22.6.0'), true);
+    assert.equal(isSupportedNodeVersion('v24.1.0'), true);
+    assert.equal(isSupportedNodeVersion('22.5.9'), false);
+    assert.equal(isSupportedNodeVersion('20.19.0'), false);
+
+    assert.equal(isEphemeralCheckoutPath('/tmp/codex-markup'), true);
+    assert.equal(isEphemeralCheckoutPath('/Users/u/.npm/_npx/123/node_modules/codex-markup'), true);
+    assert.equal(isEphemeralCheckoutPath('/Users/u/Projects/codex-markup'), false);
+
+    const codexHome = makeTempDir('codex-home-copy-');
+    const configPath = path.join(codexHome, 'config.toml');
+    const agentsPath = path.join(codexHome, 'AGENTS.md');
+    const copiedRoot = path.join(codexHome, 'tools', 'codex-markup');
+    const copiedCli = path.join(copiedRoot, 'src', 'cli.ts');
+    const skillPath = path.join(codexHome, 'skills', 'inline-html-review', 'SKILL.md');
+
+    fs.writeFileSync(configPath, 'model = "gpt-5"\n', 'utf8');
+    fs.writeFileSync(agentsPath, '# Custom\nKeep local notes.\n', 'utf8');
+
+    const installOut = await runCli(['install', '--codex-home', codexHome, '--copy']);
+    assert.match(installOut.stdout, /✓ Installed runtime files to/);
+    assert.match(installOut.stdout, /STATUS: OK/);
+    assert.equal(fs.existsSync(copiedCli), true);
+
+    const configText = fs.readFileSync(configPath, 'utf8');
+    const skillText = fs.readFileSync(skillPath, 'utf8');
+    assert.equal(configText.includes(copiedCli), true);
+    assert.equal(skillText.includes(copiedCli), true);
+
+    const doctorOk = await runCli(['doctor', '--codex-home', codexHome]);
+    assert.match(doctorOk.stdout, /\[node-version\]/);
+    assert.match(doctorOk.stdout, /\[mcp-handshake\]/);
+    assert.match(doctorOk.stdout, /STATUS: OK/);
+
+    const emptyHome = makeTempDir('codex-home-empty-');
+    await assert.rejects(
+      () => runCli(['doctor', '--codex-home', emptyHome]),
+      (err: unknown) => {
+        assert.ok(err && typeof err === 'object' && 'stdout' in err);
+        assert.match(String((err as { stdout: string }).stdout), /STATUS: FAILED/);
+        return true;
+      }
+    );
+
+    const uninstallOut = await runCli(['uninstall', '--codex-home', codexHome]);
+    assert.match(uninstallOut.stdout, /✓ Uninstalled codex-markup/);
+    assert.equal(fs.existsSync(path.join(codexHome, 'skills', 'inline-html-review')), false);
+    assert.equal(fs.existsSync(copiedRoot), false);
+
+    const configAfterUninstall = fs.readFileSync(configPath, 'utf8');
+    const agentsAfterUninstall = fs.readFileSync(agentsPath, 'utf8');
+    assert.match(configAfterUninstall, /^model = "gpt-5"/);
+    assert.equal(configAfterUninstall.includes('inline-review'), false);
+    assert.match(agentsAfterUninstall, /# Custom/);
+    assert.equal(agentsAfterUninstall.includes('BEGIN CODEX-INLINE-REVIEW'), false);
+  });
+
+  it('validates install.sh offline idempotently and bin/codex-markup.js entrypoint', async () => {
+    const installScript = path.join(REPO_ROOT, 'install.sh');
+    await execFileAsync('bash', ['-n', installScript], { cwd: REPO_ROOT });
+
+    const shHome = makeTempDir('codex-home-sh-');
+    const shEnv = {
+      ...process.env,
+      PATH: `${path.dirname(process.execPath)}:${process.env.PATH || ''}`,
+      CODEX_HOME: shHome,
+      CODEX_MARKUP_SOURCE_DIR: REPO_ROOT,
+      CODEX_REVIEW_PORT: '99999',
+    };
+
+    const firstRun = await execFileAsync('bash', [installScript], { cwd: REPO_ROOT, env: shEnv });
+    assert.match(firstRun.stdout, /STATUS: OK/);
+    assert.equal(fs.existsSync(path.join(shHome, 'tools', 'codex-markup', 'src', 'cli.ts')), true);
+
+    const configFirst = fs.readFileSync(path.join(shHome, 'config.toml'), 'utf8');
+    const agentsFirst = fs.readFileSync(path.join(shHome, 'AGENTS.md'), 'utf8');
+
+    const secondRun = await execFileAsync('bash', [installScript], { cwd: REPO_ROOT, env: shEnv });
+    assert.match(secondRun.stdout, /STATUS: OK/);
+    assert.equal(fs.readFileSync(path.join(shHome, 'config.toml'), 'utf8'), configFirst);
+    assert.equal(fs.readFileSync(path.join(shHome, 'AGENTS.md'), 'utf8'), agentsFirst);
+
+    const binHelp = await execFileAsync(
+      process.execPath,
+      [path.join(REPO_ROOT, 'bin', 'codex-markup.js'), '--help'],
+      { cwd: REPO_ROOT }
+    );
+    assert.match(binHelp.stdout, /\bdoctor\b/);
+    assert.match(binHelp.stdout, /\buninstall\b/);
   });
 });
