@@ -8,31 +8,25 @@ Open a local HTML file, highlight text or pick an element, and tell Codex what t
 
 ## Install
 
-Install directly into `~/.codex` (recommended — ~1–2s):
+Requires **Node.js 22.18+ (22.x) or 24+**, and Git or `curl` + `tar`. To have Codex make changes, install Codex CLI and sign in first.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chkche1/codex-markup/main/install.sh | bash
 ```
 
-Or via `npx` (auto-relocates permanently to `~/.codex/tools/codex-markup`):
+The installer downloads to `~/.codex/tools/codex-markup`, registers the MCP server, installs the skill and review instructions, and verifies all five MCP tools. No `npm install` is needed. Restart Codex when it finishes.
+
+Re-run the same command to update. The download is checked before replacing the current installation; a failed installation restores the previous runtime and configuration. The installer prints download time, setup timings, and commands for your installed paths.
+
+You can also install with:
 
 ```bash
 npx -y github:chkche1/codex-markup install
 ```
 
-Or from a local checkout (for contributors):
+This copies the runtime out of the package cache into the same permanent tools directory. The installed CLI continues to work after that cache is cleared.
 
-```bash
-git clone --depth 1 https://github.com/chkche1/codex-markup.git
-cd codex-markup
-npm run install-codex
-```
-
-**Notes for humans & AI agents:**
-- **Requires Node.js >= 22.6.0** (`install.sh` auto-detects Homebrew, `nvm`, `fnm`, `volta`, and `mise`).
-- **Zero runtime npm dependencies** — skip `npm install`.
-- **Self-verifying & idempotent** — registers `[mcp_servers.inline-review]` in `~/.codex/config.toml`, installs the `inline-html-review` skill and `~/.codex/AGENTS.md` block, runs an MCP smoke test, and exits cleanly. Do **not** run `npm run demo` during install (it starts a foreground server).
-- Restart Codex after installing. Verify anytime with `node --no-warnings ~/.codex/tools/codex-markup/src/cli.ts doctor`, or remove cleanly with `uninstall`.
+For a custom location, set `CODEX_HOME` for the configuration directory or `CODEX_MARKUP_DIR` for the shell installer's runtime directory. Use the paths printed by the installer in the commands below.
 
 ## Why use it?
 
@@ -47,36 +41,30 @@ Built for local HTML prototypes, dashboards, and reports. No build step or exter
 
 ## Try the demo
 
-Requires Node.js 22.6 or newer. To have Codex make changes, install Codex CLI and sign in first.
+After installing, run:
 
 ```bash
-git clone https://github.com/chkche1/codex-markup.git
-cd codex-markup
-npm run demo
+node --no-warnings ~/.codex/tools/codex-markup/src/cli.ts serve ~/.codex/tools/codex-markup/examples/demo.html
 ```
 
-This opens [the example dashboard](examples/demo.html) at `http://127.0.0.1:4321` with the review overlay.
+This opens the example dashboard with the review overlay. The server stays running in the terminal; press `Ctrl+C` to stop it.
 
-1. Click **Pick Element**, then click part of the page. You can also highlight text to comment on it.
-2. Write your feedback. Leave **Send to Codex** checked to send it immediately, or uncheck it to collect comments first.
+1. Click **Pick Element**, then click part of the page, or highlight text to comment on it.
+2. Write your feedback. Leave **Send to Codex** checked to send immediately, or uncheck it to collect several comments.
 3. Click **Submit to Codex** when your queued feedback is ready.
 4. Watch the preview update and read Codex's replies in the threads.
 
-Submitting feedback works differently depending on how the server is running:
-
-- **Connected Codex session (MCP / `wait`):** feedback returns directly to your active Codex CLI or Codex Desktop session and runs under that session's sandbox permissions. The browser dock displays a read-only **Session Sandbox** badge.
-- **Standalone background runs (`serve` / `demo`):** when no session is listening, `codex-markup` launches a local `codex exec` run. For local convenience, standalone unsandboxed servers default to **Full Access** (`--dangerously-bypass-approvals-and-sandbox`), indicated in the dock and CLI startup output. Click the toolbar badge or launch with `--sandbox workspace-write` (or `CODEX_MARKUP_SANDBOX=workspace-write`) to restrict writes to the enclosing Git/project root with no network.
-- **Externally sandboxed / policy-restricted hosts:** if the server was launched inside an outer OS sandbox or a managed `/etc/codex/requirements.toml` policy restricts `danger-full-access`, the toolbar locks to a read-only **Host Sandboxed** or **Policy Sandboxed** badge explaining why.
+When a Codex session is listening through MCP, feedback returns to that session under its permissions. Otherwise, the server starts a background Codex CLI run. Standalone runs default to **Full Access**, bypassing sandbox and approval restrictions. Add `--sandbox workspace-write` to the `serve` command to restrict access. The toolbar shows the active mode; host sandboxing and managed policies may lock it.
 
 Voice input is available when your browser supports speech recognition.
 
 ## Review your own HTML
 
 ```bash
-node --no-warnings src/cli.ts serve /path/to/page.html
+node --no-warnings ~/.codex/tools/codex-markup/src/cli.ts serve /path/to/page.html
 ```
 
-The server runs locally on loopback. Comments are saved beside the HTML file; commit the `.comments.json` file to preserve a review, or ignore it for temporary feedback.
+The server runs locally on loopback. Threads are saved in `<file.html>.comments.json`; keep that file in Git to preserve a review.
 
 ## Connect to Codex
 
@@ -94,25 +82,34 @@ The integration provides five tools:
 | `reply_to_comment` | Reply and update a thread's status. |
 | `resolve_comment` | Resolve or reopen a thread. |
 
-For manual configuration, run `node --no-warnings src/cli.ts setup`. Use `install --codex-home /path/to/config` for a custom Codex configuration directory, `doctor` to verify the MCP handshake, and `uninstall` to cleanly remove the integration.
-
-## Useful commands
-
-Run these from the repository:
+## Verify, update, or remove
 
 ```bash
-# Read open comments
-node --no-warnings src/cli.ts comments /path/to/page.html
+# Verify the installed files and MCP handshake
+node --no-warnings ~/.codex/tools/codex-markup/src/cli.ts doctor
 
-# Reply and resolve a thread
-node --no-warnings src/cli.ts reply /path/to/page.html c-1 "Updated the spacing." --resolve
-
-# Reopen a thread
-node --no-warnings src/cli.ts resolve /path/to/page.html c-1 --reopen
-
-# Run the test suite
-npm test
+# Remove the integration and its managed runtime
+node --no-warnings ~/.codex/tools/codex-markup/src/cli.ts uninstall
 ```
+
+`doctor` checks the MCP integration. It does not verify Codex login or load the integration into an existing chat. Restart Codex after installation or removal. Close any existing preview servers separately.
+
+Uninstall preserves your HTML and review files outside the managed runtime, unrelated Codex settings, and contributor checkouts. A custom managed runtime is removed too. Use `uninstall --keep-runtime` to keep the runtime files. Store your own documents outside the managed runtime: updates replace that directory.
+
+To update, re-run the recommended install command above.
+
+## Contributing
+
+```bash
+git clone https://github.com/chkche1/codex-markup.git
+cd codex-markup
+npm test
+npm run demo
+```
+
+No dependency installation is needed. `npm run install-codex` connects Codex to this checkout; keep the checkout in place. Use `npm run doctor` to verify it. For a separate managed copy, run `node --no-warnings src/cli.ts install --copy`.
+
+`install --codex-home /path/to/config` targets a custom configuration directory. `install --install-dir /path/to/runtime` creates a managed copy. `install --json` returns the runtime location, version, setup phase timings, verification status, and restart requirement for automation. Setup timings exclude the shell download and Node process startup.
 
 ## License
 

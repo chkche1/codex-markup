@@ -81,6 +81,7 @@ OPTIONS:
   --codex-home <dir>              Custom Codex configuration directory (default: ~/.codex)
   --copy                          Copy runtime to <codex-home>/tools/codex-markup on install
   --install-dir <dir>             Explicit runtime destination directory on install (implies --copy)
+  --json                          Print an installation result as JSON (install only)
   --no-verify                     Skip post-install MCP verification in 'install'
   --no-open                       Do not automatically open the browser on 'serve'
   -h, --help                      Show this help message
@@ -170,6 +171,7 @@ async function main() {
       copy: Boolean(flags.copy),
       installDir,
       skipVerify: Boolean(flags['no-verify']),
+      json: Boolean(flags.json),
     });
     return;
   }

@@ -1,7 +1,7 @@
 {
   "name": "codex-markup",
   "version": "1.0.0",
-  "description": "Claude Artifacts-style HTML preview and inline commenting server + MCP integration for OpenAI Codex",
+  "description": "Visual HTML reviews for Codex CLI with persistent comments and live updates",
   "type": "module",
   "bin": {
     "codex-markup": "./bin/codex-markup.js",
@@ -18,7 +18,7 @@
     "uninstall-codex": "node --no-warnings src/cli.ts uninstall"
   },
   "engines": {
-    "node": ">=22.6.0"
+    "node": "^22.18.0 || >=24.0.0"
   },
   "keywords": [
     "codex",

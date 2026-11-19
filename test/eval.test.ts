@@ -1300,7 +1300,10 @@ describe('Suite 4 — CLI End-to-End Evaluation', () => {
   });
 
   it('supports --copy runtime relocation, doctor verification, and clean uninstall round-trip', async () => {
-    assert.equal(isSupportedNodeVersion('22.6.0'), true);
+    assert.equal(isSupportedNodeVersion('22.18.0'), true);
+    assert.equal(isSupportedNodeVersion('22.6.0'), false);
+    assert.equal(isSupportedNodeVersion('22.17.0'), false);
+    assert.equal(isSupportedNodeVersion('23.0.0'), false);
     assert.equal(isSupportedNodeVersion('v24.1.0'), true);
     assert.equal(isSupportedNodeVersion('22.5.9'), false);
     assert.equal(isSupportedNodeVersion('20.19.0'), false);
@@ -1389,5 +1392,103 @@ describe('Suite 4 — CLI End-to-End Evaluation', () => {
     );
     assert.match(binHelp.stdout, /\bdoctor\b/);
     assert.match(binHelp.stdout, /\buninstall\b/);
+  });
+});
+
+describe('Installation distribution and recovery', () => {
+  it('installs a packed package from node_modules and removes its custom runtime', async () => {
+    const dir = makeTempDir('codex-package-');
+    const pack = await execFileAsync('npm', ['pack', '--json', '--pack-destination', dir], { cwd: REPO_ROOT });
+    const archives = fs.readdirSync(dir).filter((name) => name.endsWith('.tgz'));
+    assert.equal(archives.length, 1, pack.stdout);
+    const packagedRoot = path.join(dir, 'node_modules', 'codex-markup');
+    fs.mkdirSync(packagedRoot, { recursive: true });
+    await execFileAsync('tar', ['-xzf', path.join(dir, archives[0]), '--strip-components=1', '-C', packagedRoot]);
+    const home = path.join(dir, "configuration 'quoted'");
+    const runtime = path.join(dir, "permanent 'runtime'");
+    const installed = await execFileAsync(process.execPath, [path.join(packagedRoot, 'bin', 'codex-markup.js'),
+      'install', '--codex-home', home, '--install-dir', runtime, '--json']);
+    const result = JSON.parse(installed.stdout);
+    assert.equal(result.status, 'verified');
+    assert.equal(result.runtimeRoot, runtime);
+    assert.equal(result.restartRequired, true);
+    assert.ok(result.phaseMs.verification >= 0);
+    assert.equal(fs.existsSync(path.join(runtime, 'examples', 'demo.html')), true);
+    const repeated = await execFileAsync(process.execPath, [path.join(runtime, 'src', 'cli.ts'),
+      'install', '--codex-home', home, '--install-dir', runtime]);
+    const doctorCommand = repeated.stdout.split('\n').find((line) => line.startsWith('Doctor: '));
+    assert.ok(doctorCommand);
+    await execFileAsync('bash', ['-c', doctorCommand.slice('Doctor: '.length)]);
+    // Prove the installed CLI survives removal of the package cache.
+    fs.rmSync(packagedRoot, { recursive: true });
+    await execFileAsync(process.execPath, [path.join(runtime, 'src', 'cli.ts'), 'doctor', '--codex-home', home]);
+    await execFileAsync(process.execPath, [path.join(runtime, 'src', 'cli.ts'), 'uninstall', '--codex-home', home]);
+    assert.equal(fs.existsSync(runtime), false);
+    assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8').includes('inline-review'), false);
+  });
+
+  it('preserves an unowned directory and contributor source checkout during uninstall', async () => {
+    const home = makeTempDir('codex-ownership-');
+    const runtime = path.join(home, 'foreign');
+    fs.mkdirSync(runtime);
+    fs.writeFileSync(path.join(runtime, 'notes.txt'), 'keep me');
+    await assert.rejects(() => runCli(['install', '--codex-home', home, '--install-dir', runtime]));
+    assert.equal(fs.readFileSync(path.join(runtime, 'notes.txt'), 'utf8'), 'keep me');
+    // A forged manifest alone cannot authorize removal without a matching runtime marker.
+    fs.writeFileSync(path.join(home, 'codex-markup-install.json'), JSON.stringify({ runtimeRoot: runtime, codexHome: home, managed: true }));
+    await runCli(['uninstall', '--codex-home', home]);
+    assert.equal(fs.existsSync(runtime), true);
+    const source = path.join(home, 'checkout');
+    fs.cpSync(REPO_ROOT, source, { recursive: true, filter: (entry) => !['.git', 'node_modules'].includes(path.basename(entry)) });
+    const { installForCodex } = await import('../src/install.ts');
+    // Installing in place must never confer ownership of a contributor checkout.
+    await installForCodex({ sourceRoot: source, codexHome: home, installDir: source, json: true });
+    await runCli(['uninstall', '--codex-home', home]);
+    assert.equal(fs.existsSync(path.join(source, 'src', 'cli.ts')), true);
+  });
+
+  it('keeps a working install after download or verification failure and replaces it on success', async () => {
+    const dir = makeTempDir('codex-update-');
+    const remote = path.join(dir, 'remote');
+    fs.cpSync(REPO_ROOT, remote, { recursive: true, filter: (entry) => !['.git', 'node_modules'].includes(path.basename(entry)) });
+    await execFileAsync('git', ['init', '-b', 'main', remote]);
+    await execFileAsync('git', ['add', '.'], { cwd: remote });
+    await execFileAsync('git', ['-c', 'user.name=Installation Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'fixture'], { cwd: remote });
+    const home = path.join(dir, 'home');
+    const runtime = path.join(dir, 'runtime');
+    const script = path.join(REPO_ROOT, 'install.sh');
+    const env = { ...process.env, CODEX_HOME: home, CODEX_MARKUP_DIR: runtime,
+      CODEX_MARKUP_SOURCE_DIR: '', CODEX_MARKUP_REPO: remote };
+    await execFileAsync('bash', [script], { env });
+    const config = fs.readFileSync(path.join(home, 'config.toml'), 'utf8');
+    fs.writeFileSync(path.join(runtime, 'sentinel'), 'old runtime');
+    await assert.rejects(() => execFileAsync('bash', [script], { env: { ...env, CODEX_MARKUP_REPO: path.join(dir, 'missing-repository') } }));
+    assert.equal(fs.readFileSync(path.join(runtime, 'sentinel'), 'utf8'), 'old runtime');
+    assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), config);
+    fs.writeFileSync(path.join(remote, 'src', 'cli.ts'), 'throw new Error("bad release");');
+    await execFileAsync('git', ['add', '.'], { cwd: remote });
+    await execFileAsync('git', ['-c', 'user.name=Installation Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'broken fixture'], { cwd: remote });
+    await assert.rejects(() => execFileAsync('bash', [script], { env }));
+    assert.equal(fs.readFileSync(path.join(runtime, 'sentinel'), 'utf8'), 'old runtime');
+    assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), config);
+    await execFileAsync(process.execPath, [path.join(runtime, 'src', 'cli.ts'), 'doctor', '--codex-home', home]);
+    await execFileAsync('git', ['revert', '--no-edit', 'HEAD'], { cwd: remote, env: { ...process.env,
+      GIT_COMMITTER_NAME: 'Installation Test', GIT_COMMITTER_EMAIL: 'test@example.invalid' } });
+    const workingCli = fs.readFileSync(path.join(remote, 'src', 'cli.ts'), 'utf8');
+    fs.writeFileSync(path.join(remote, 'src', 'cli.ts'),
+      `import failureFs from 'node:fs'; if (process.argv.includes(${JSON.stringify(home)})) { failureFs.writeFileSync(${JSON.stringify(path.join(home, 'config.toml'))}, 'partial configuration'); process.exit(1); }\n` + workingCli);
+    await execFileAsync('git', ['add', '.'], { cwd: remote });
+    await execFileAsync('git', ['-c', 'user.name=Installation Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'registration failure fixture'], { cwd: remote });
+    await assert.rejects(() => execFileAsync('bash', [script], { env }));
+    assert.equal(fs.readFileSync(path.join(runtime, 'sentinel'), 'utf8'), 'old runtime');
+    assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), config);
+    await execFileAsync(process.execPath, [path.join(runtime, 'src', 'cli.ts'), 'doctor', '--codex-home', home]);
+    await execFileAsync('git', ['revert', '--no-edit', 'HEAD'], { cwd: remote, env: { ...process.env,
+      GIT_COMMITTER_NAME: 'Installation Test', GIT_COMMITTER_EMAIL: 'test@example.invalid' } });
+    await execFileAsync('bash', [script], { env });
+    assert.equal(fs.existsSync(path.join(runtime, 'sentinel')), false);
+    assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), config);
+    await execFileAsync(process.execPath, [path.join(runtime, 'src', 'cli.ts'), 'uninstall', '--codex-home', home]);
+    assert.equal(fs.existsSync(runtime), false);
   });
 });

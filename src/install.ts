@@ -39,6 +39,7 @@ export interface InstallOptions {
   skipVerify?: boolean;
   sourceRoot?: string;
   nodeBin?: string;
+  json?: boolean;
 }
 
 export interface InstallResult {
@@ -63,12 +64,45 @@ export interface UninstallResult {
   removedRuntimeDir: boolean;
 }
 
+const MANIFEST = 'codex-markup-install.json';
+const OWNER_MARKER = '.codex-markup-owned.json';
+
+function readInstallation(file: string): { runtimeRoot: string; codexHome: string; managed: boolean } | undefined {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (value && typeof value === 'object' &&
+        'runtimeRoot' in value && typeof value.runtimeRoot === 'string' &&
+        'codexHome' in value && typeof value.codexHome === 'string' &&
+        'managed' in value && typeof value.managed === 'boolean') {
+      return { runtimeRoot: value.runtimeRoot, codexHome: value.codexHome, managed: value.managed };
+    }
+  } catch { /* An absent or invalid manifest never authorizes runtime removal. */ }
+  return undefined;
+}
+
+function ownsRuntime(runtimeRoot: string, codexHome: string): boolean {
+  const owner = readInstallation(path.join(runtimeRoot, OWNER_MARKER));
+  return Boolean(owner?.managed && owner.runtimeRoot === runtimeRoot && owner.codexHome === codexHome &&
+    !fs.lstatSync(runtimeRoot).isSymbolicLink());
+}
+
+function isLegacyManagedRuntime(runtimeRoot: string, codexHome: string): boolean {
+  if (runtimeRoot !== path.join(codexHome, 'tools', 'codex-markup') || !fs.existsSync(runtimeRoot) ||
+      fs.lstatSync(runtimeRoot).isSymbolicLink()) return false;
+  try {
+    const pkg: unknown = JSON.parse(fs.readFileSync(path.join(runtimeRoot, 'package.json'), 'utf8'));
+    const config = extractMcpServerConfig(fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf8'));
+    return Boolean(pkg && typeof pkg === 'object' && 'name' in pkg && pkg.name === 'codex-markup' &&
+      config?.args.includes(path.join(runtimeRoot, 'src', 'cli.ts')));
+  } catch { return false; }
+}
+
 export function isSupportedNodeVersion(versionStr: string): boolean {
   const match = versionStr.trim().match(/^v?(\d+)\.(\d+)/);
   if (!match) return false;
   const major = Number(match[1]);
   const minor = Number(match[2]);
-  return major > 22 || (major === 22 && minor >= 6);
+  return major >= 24 || (major === 22 && minor >= 18);
 }
 
 export function resolveCodexHome(
@@ -90,7 +124,7 @@ export function resolveInstallNodeBin(
 ): string {
   if (!isSupportedNodeVersion(nodeVersion)) {
     throw new Error(
-      `codex-markup requires Node.js >= 22.6.0 (running v${nodeVersion} at ${execPath}). Switch to Node 22.6+ and retry.`
+      `codex-markup requires Node.js 22.18+ (22.x) or 24+ (running v${nodeVersion} at ${execPath}). Switch to Node 22.18+ and retry.`
     );
   }
   return execPath;
@@ -144,6 +178,10 @@ export function isEphemeralCheckoutPath(repoRoot: string): boolean {
 export function copyRuntimeToDir(sourceRoot: string, targetDir: string): void {
   const resolvedSource = path.resolve(sourceRoot);
   const resolvedTarget = path.resolve(targetDir);
+  if (resolvedSource !== resolvedTarget &&
+      (isWithinDir(resolvedTarget, resolvedSource) || isWithinDir(resolvedSource, resolvedTarget))) {
+    throw new Error('Runtime source and destination must not contain one another');
+  }
   if (
     resolvedSource === resolvedTarget ||
     (fs.existsSync(resolvedTarget) && safeRealpath(resolvedSource) === safeRealpath(resolvedTarget))
@@ -152,7 +190,7 @@ export function copyRuntimeToDir(sourceRoot: string, targetDir: string): void {
   }
 
   fs.mkdirSync(resolvedTarget, { recursive: true });
-  const entries = ['package.json', 'bin', 'src', 'skills', 'README.md', 'LICENSE'];
+  const entries = ['package.json', 'bin', 'src', 'skills', 'examples/demo.html', 'README.md', 'LICENSE'];
   for (const entry of entries) {
     const srcPath = path.join(resolvedSource, entry);
     if (!fs.existsSync(srcPath)) continue;
@@ -405,13 +443,13 @@ export async function runDoctor(options?: {
     checks.push({
       name: 'node-version',
       status: 'pass',
-      detail: `Node.js v${process.versions.node} (>= 22.6.0)`,
+      detail: `Node.js v${process.versions.node} (22.18+ (22.x) or 24+)`,
     });
   } else {
     checks.push({
       name: 'node-version',
       status: 'fail',
-      detail: `Node.js v${process.versions.node} is below required >= 22.6.0`,
+      detail: `Node.js v${process.versions.node} is unsupported; use 22.18+ (22.x) or 24+`,
     });
   }
 
@@ -572,6 +610,15 @@ export async function runDoctor(options?: {
 }
 
 export async function installForCodex(options?: InstallOptions): Promise<InstallResult> {
+  const started = performance.now();
+  let phaseStart = started;
+  const phaseMs: Record<string, number> = {};
+  const phase = (name: string) => {
+    const now = performance.now();
+    phaseMs[name] = Math.round((now - phaseStart) * 100) / 100;
+    phaseStart = now;
+  };
+  const log = (message: string) => { if (!options?.json) console.log(message); };
   const codexHome = resolveCodexHome(options?.codexHome);
   const sourceRoot = path.resolve(
     options?.sourceRoot || path.resolve(import.meta.dirname || '.', '..')
@@ -584,13 +631,24 @@ export async function installForCodex(options?: InstallOptions): Promise<Install
     ? path.resolve(options?.installDir || path.join(codexHome, 'tools', 'codex-markup'))
     : sourceRoot;
 
+  if (isWithinDir(codexHome, installRoot)) {
+    throw new Error('Runtime directory must not contain the Codex configuration directory');
+  }
+  if (shouldCopy && fs.existsSync(installRoot) && fs.lstatSync(installRoot).isSymbolicLink()) {
+    throw new Error(`Refusing to overwrite a symlink runtime directory: ${installRoot}`);
+  }
+  if (shouldCopy && installRoot !== sourceRoot && fs.existsSync(installRoot) &&
+      !ownsRuntime(installRoot, codexHome) && !isLegacyManagedRuntime(installRoot, codexHome) && fs.readdirSync(installRoot).length > 0) {
+    throw new Error(`Refusing to overwrite an unowned runtime directory: ${installRoot}`);
+  }
   if (shouldCopy) {
     copyRuntimeToDir(sourceRoot, installRoot);
-    console.log(
+    log(
       `✓ Installed runtime files to ${installRoot}${ephemeral ? ' (relocated from ephemeral path)' : ''}`
     );
   }
 
+  phase('runtime');
   const cliEntry = path.join(installRoot, 'src', 'cli.ts');
   fs.mkdirSync(codexHome, { recursive: true });
 
@@ -615,7 +673,7 @@ export async function installForCodex(options?: InstallOptions): Promise<Install
     updatedConfig = trimmed ? `${trimmed}\n\n${tomlBlock}\n` : `${tomlBlock}\n`;
   }
   fs.writeFileSync(configPath, updatedConfig, 'utf8');
-  console.log(`✓ Configured MCP server [mcp_servers.inline-review] in ${configPath}`);
+  log(`✓ Configured MCP server [mcp_servers.inline-review] in ${configPath}`);
 
   // 2. Install Skill into ~/.codex/skills/inline-html-review/SKILL.md
   const sourceSkillPath = path.join(installRoot, 'skills', 'inline-html-review', 'SKILL.md');
@@ -627,7 +685,7 @@ export async function installForCodex(options?: InstallOptions): Promise<Install
     .replaceAll('<path-to-codex-markup>/src/cli.ts', cliEntry)
     .replaceAll('<path-to-codex-inline-review>/src/cli.ts', cliEntry);
   fs.writeFileSync(targetSkillPath, resolvedSkill, 'utf8');
-  console.log(`✓ Installed Codex skill to ${targetSkillPath}`);
+  log(`✓ Installed Codex skill to ${targetSkillPath}`);
 
   // 3. Add global instruction block to ~/.codex/AGENTS.md
   const agentsPath = path.join(codexHome, 'AGENTS.md');
@@ -653,14 +711,14 @@ export async function installForCodex(options?: InstallOptions): Promise<Install
     updatedAgents = trimmed ? `${trimmed}\n\n${agentsSnippet}\n` : `${agentsSnippet}\n`;
   }
   fs.writeFileSync(agentsPath, updatedAgents, 'utf8');
-  console.log(`✓ Updated global instructions in ${agentsPath}`);
+  log(`✓ Updated global instructions in ${agentsPath}`);
 
+  phase('registration');
   let doctor: DoctorReport | undefined;
   if (!options?.skipVerify) {
     doctor = await runDoctor({ codexHome, quiet: true });
     if (doctor.ok) {
-      console.log(`✓ Verified MCP server (${doctor.tools.length} tools: ${doctor.tools.join(', ')})`);
-      console.log('STATUS: OK — Restart Codex to load [mcp_servers.inline-review].');
+      log(`✓ Verified MCP server (${doctor.tools.length} tools: ${doctor.tools.join(', ')})`);
     } else {
       for (const check of doctor.checks) {
         if (check.status === 'fail') {
@@ -669,6 +727,35 @@ export async function installForCodex(options?: InstallOptions): Promise<Install
       }
       throw new Error('Installation verification failed');
     }
+  }
+
+  phase('verification');
+  const managed = (shouldCopy && installRoot !== sourceRoot) || ownsRuntime(installRoot, codexHome) || isLegacyManagedRuntime(installRoot, codexHome);
+  const installation = { runtimeRoot: installRoot, codexHome, managed };
+  if (managed) {
+    fs.writeFileSync(path.join(installRoot, OWNER_MARKER), JSON.stringify(installation, null, 2) + '\n');
+  }
+  fs.writeFileSync(path.join(codexHome, MANIFEST), JSON.stringify(installation, null, 2) + '\n');
+  const packageInfo: unknown = JSON.parse(fs.readFileSync(path.join(installRoot, 'package.json'), 'utf8'));
+  const version = packageInfo && typeof packageInfo === 'object' && 'version' in packageInfo
+    ? String(packageInfo.version) : 'unknown';
+  const elapsedMs = Math.round((performance.now() - started) * 100) / 100;
+  const result = { status: doctor?.ok ? 'verified' : 'unverified', version, runtimeRoot: installRoot,
+    codexHome, elapsedMs, phaseMs, restartRequired: true };
+  if (options?.json) {
+    console.log(JSON.stringify(result));
+  } else {
+    log(`Installed codex-markup ${version} at ${installRoot} (${elapsedMs} ms)`);
+    log(`Timing: runtime ${phaseMs.runtime} ms; registration ${phaseMs.registration} ms; verification ${phaseMs.verification} ms`);
+    log(doctor?.ok ? 'STATUS: OK — Restart Codex to load [mcp_servers.inline-review].' : 'STATUS: UNVERIFIED — run doctor before use.');
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    const cli = quote(cliEntry);
+    const node = quote(nodeBin);
+    const home = ` --codex-home ${quote(codexHome)}`;
+    log(`Doctor: ${node} --no-warnings ${cli} doctor${home}`);
+    log(`Demo: ${node} --no-warnings ${cli} serve ${quote(path.join(installRoot, 'examples', 'demo.html'))}`);
+    log(`Review: ${node} --no-warnings ${cli} serve /path/to/page.html`);
+    log(`Uninstall: ${node} --no-warnings ${cli} uninstall${home}`);
   }
 
   return {
@@ -683,6 +770,11 @@ export async function installForCodex(options?: InstallOptions): Promise<Install
 
 export function uninstallFromCodex(options?: UninstallOptions): UninstallResult {
   const codexHome = resolveCodexHome(options?.codexHome);
+  const manifestPath = path.join(codexHome, MANIFEST);
+  const legacyRoot = path.join(codexHome, 'tools', 'codex-markup');
+  const legacyManaged = isLegacyManagedRuntime(legacyRoot, codexHome);
+  const installation = readInstallation(manifestPath) ??
+    (legacyManaged ? { runtimeRoot: legacyRoot, codexHome, managed: true } : undefined);
   let removedConfigSection = false;
   let removedSkillDir = false;
   let removedAgentsBlock = false;
@@ -723,14 +815,14 @@ export function uninstallFromCodex(options?: UninstallOptions): UninstallResult 
     }
   }
 
-  if (!options?.keepRuntime) {
-    const runtimeDir = path.join(codexHome, 'tools', 'codex-markup');
-    if (fs.existsSync(runtimeDir)) {
-      fs.rmSync(runtimeDir, { recursive: true, force: true });
-      removedRuntimeDir = true;
-      console.log(`✓ Removed runtime directory ${runtimeDir}`);
-    }
+  if (!options?.keepRuntime && installation?.managed && installation.codexHome === codexHome &&
+      (ownsRuntime(installation.runtimeRoot, codexHome) || (legacyManaged && installation.runtimeRoot === legacyRoot))) {
+    fs.rmSync(installation.runtimeRoot, { recursive: true, force: true });
+    removedRuntimeDir = true;
+    console.log(`✓ Removed runtime directory ${installation.runtimeRoot}`);
   }
+  if (!options?.keepRuntime && fs.existsSync(manifestPath)) fs.unlinkSync(manifestPath);
+  console.log('Restart Codex to unload the integration; existing preview servers must be closed separately.');
 
   console.log(`✓ Uninstalled codex-markup from ${codexHome}`);
   return {

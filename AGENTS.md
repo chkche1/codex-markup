@@ -2,7 +2,7 @@
 
 ## Installing `codex-markup` for a User
 
-If asked to install this repository for Codex, run this single idempotent, self-verifying command (requires Node.js `>=22.6.0`, zero npm dependencies — do **not** run `npm install` or `npm run demo`):
+If asked to install this repository for Codex, run this single idempotent, self-verifying command (requires Node.js `22.18+ (22.x) or 24+`, zero npm dependencies — do **not** run `npm install` or `npm run demo`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chkche1/codex-markup/main/install.sh | bash
@@ -46,7 +46,7 @@ Whenever you create or update an HTML artifact/page for the user, or when the us
 | :--- | :--- |
 | `src/cli.ts` | CLI entry point (`serve`, `mcp`, `wait`, `comments` / `list`, `add-comment`, `reply`, `resolve`, `restart`, `install`, `doctor`, `uninstall`, `setup`). |
 | `src/install.ts` | Codex Desktop/CLI installer (`installForCodex`), ephemeral checkout relocation (`copyRuntimeToDir`), verification (`runDoctor` + MCP smoke test), and clean removal (`uninstallFromCodex`). |
-| `install.sh` | Fast standalone bootstrapper: locates Node `>=22.6.0`, clones/updates `~/.codex/tools/codex-markup` (with tarball fallback), and runs `install`. |
+| `install.sh` | Fast standalone bootstrapper: locates Node `22.18+ (22.x) or 24+`, stages and verifies updates to `~/.codex/tools/codex-markup` (with tarball fallback), and runs `install`. |
 | `src/server.ts` | `InlineReviewServer` HTTP + Server-Sent Events (SSE) server, static relative asset serving, `<script>` widget injection (`injectReviewWidget`), `fs.watch` live-reload watchers, and background `codex exec --ephemeral` dispatch (`runBackgroundCodex`). |
 | `src/widget.ts` | Client-side review overlay (`getWidgetScript`) mounted inside an open Shadow DOM (`#codex-inline-review-root`) with text selection highlighting, DOM element picker, dark floating popovers (`openComposerPopover`, `openThreadPopover`), Web Speech dictation (`🎙️`), collapsible right-hand thread drawer (`💬 Threads`), and SSE synchronization. |
 | `src/mcp.ts` | Zero-dependency JSON-RPC 2.0 MCP stdio server (`startMcpServer`) supporting both newline-delimited and `Content-Length` framing, exposing `open_html_review`, `wait_for_review`, `get_inline_comments`, `reply_to_comment`, and `resolve_comment`. |
@@ -55,7 +55,7 @@ Whenever you create or update an HTML artifact/page for the user, or when the us
 
 ### Zero External Runtime Dependency Constraint
 
-- **Node.js `>=22.6.0` Native TypeScript Execution:** All TypeScript modules run directly via `node --no-warnings src/cli.ts` using Node's built-in type-stripping (ESM `"type": "module"`, explicit `.ts` relative imports per `tsconfig.json`).
+- **Node.js `22.18+ (22.x) or 24+` Native TypeScript Execution:** All TypeScript modules run directly via `node --no-warnings src/cli.ts` using Node's built-in type-stripping (ESM `"type": "module"`, explicit `.ts` relative imports per `tsconfig.json`).
 - **No Third-Party Runtime Dependencies:** `package.json` must maintain zero runtime npm dependencies. Only use Node.js built-in `node:*` modules (`node:http`, `node:fs`, `node:path`, `node:os`, `node:crypto`, `node:child_process`) on the backend and standard browser APIs in `src/widget.ts`.
 - **Shadow DOM Isolation:** Keep all client-side overlay UI in `src/widget.ts` encapsulated within `#codex-inline-review-root` Shadow DOM (except the minimal `.cir-text-highlight` `<mark>` wrappers and `.cir-element-pulse` / `.cir-pick-mode` markers) so reviewed pages retain their own styling without CSS collisions.
 

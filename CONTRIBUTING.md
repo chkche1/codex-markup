@@ -10,7 +10,7 @@ All source files live in `src/` and run directly with Node.js without a compile/
 | :--- | :--- |
 | [`src/cli.ts`](src/cli.ts) | CLI entry point (`serve`, `mcp`, `wait`, `comments` / `list`, `add-comment`, `reply`, `resolve`, `restart`, `install`, `doctor`, `uninstall`, `setup`). |
 | [`src/install.ts`](src/install.ts) | Codex Desktop/CLI installer (`installForCodex`), ephemeral checkout relocation (`copyRuntimeToDir`), verification (`runDoctor`), and clean removal (`uninstallFromCodex`). |
-| [`install.sh`](install.sh) | Standalone one-line bootstrapper locating Node `>=22.6.0` and installing to `~/.codex/tools/codex-markup`. |
+| [`install.sh`](install.sh) | Standalone one-line bootstrapper locating Node `22.18+ (22.x) or 24+` and installing to `~/.codex/tools/codex-markup`. |
 | [`src/server.ts`](src/server.ts) | `InlineReviewServer` HTTP + SSE server, relative static asset serving, widget injection (`injectReviewWidget`), `fs.watch` live reload, and background `codex exec --ephemeral` dispatch (`runBackgroundCodex`). |
 | [`src/widget.ts`](src/widget.ts) | Client-side overlay (`getWidgetScript`) mounted in `#codex-inline-review-root`, including text highlighting, element picker, dark floating popovers (`openComposerPopover`, `openThreadPopover`), Web Speech dictation (`🎙️`), thread drawer (`💬 Threads`), and SSE sync. |
 | [`src/mcp.ts`](src/mcp.ts) | Zero-dependency JSON-RPC 2.0 MCP stdio server (`startMcpServer`) supporting newline-delimited and `Content-Length` framing (`open_html_review`, `wait_for_review`, `get_inline_comments`, `reply_to_comment`, `resolve_comment`). |
@@ -20,7 +20,7 @@ All source files live in `src/` and run directly with Node.js without a compile/
 
 ## Core Design Constraints
 
-1. **Zero External Runtime Dependencies (`Node.js >=22.6.0`):**
+1. **Zero External Runtime Dependencies (`Node.js 22.18+ (22.x) or 24+`):**
    - [`package.json`](package.json) must remain free of third-party runtime npm dependencies.
    - All TypeScript modules run directly via Node.js native type-stripping (`node --no-warnings src/cli.ts`), ESM (`"type": "module"`), and explicit `.ts` relative imports per [`tsconfig.json`](tsconfig.json).
    - Use only Node.js built-in `node:*` modules (`node:http`, `node:fs`, `node:path`, `node:os`, `node:crypto`, `node:child_process`) on the backend and standard browser APIs in `src/widget.ts`.
@@ -46,7 +46,7 @@ Always run the evaluation suite before committing changes:
 npm test
 ```
 
-- GitHub Actions CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `npm test` on `ubuntu-latest` across Node.js `22` and `24`.
+- GitHub Actions CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `npm test` on `ubuntu-latest` across Node.js `22.18.0` and `24`.
 - Keep `examples/*.comments.json` clean when testing manually against [`examples/demo.html`](examples/demo.html) (ignored by default via `.gitignore`).
 
 ## Opening Pull Requests
