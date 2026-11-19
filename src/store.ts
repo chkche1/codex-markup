@@ -116,18 +116,19 @@ function matchesCommentId(thread: CommentThread, commentId: string): boolean {
   return thread.id === normalizedId || `c-${thread.number}` === normalizedId || String(thread.number) === commentId.trim();
 }
 
-export function addReply(
-  htmlFilePath: string,
-  commentId: string,
+export interface BatchReplyInput {
+  commentId: string;
+  text: string;
+  author?: MessageAuthor;
+  status?: CommentStatus;
+}
+
+function applyReplyToThread(
+  thread: CommentThread,
   text: string,
   author: MessageAuthor,
   newStatus?: CommentStatus
-): CommentThread | null {
-  const state = loadReviewState(htmlFilePath);
-  const thread = state.threads.find((t) => matchesCommentId(t, commentId));
-  if (!thread) {
-    return null;
-  }
+): void {
   const now = new Date().toISOString();
   if (text && text.trim().length > 0) {
     thread.messages.push({
@@ -145,8 +146,51 @@ export function addReply(
     thread.status = 'open';
   }
   thread.updatedAt = now;
+}
+
+export function addReply(
+  htmlFilePath: string,
+  commentId: string,
+  text: string,
+  author: MessageAuthor,
+  newStatus?: CommentStatus
+): CommentThread | null {
+  const state = loadReviewState(htmlFilePath);
+  const thread = state.threads.find((t) => matchesCommentId(t, commentId));
+  if (!thread) {
+    return null;
+  }
+  applyReplyToThread(thread, text, author, newStatus);
   saveReviewState(htmlFilePath, state);
   return thread;
+}
+
+export function addRepliesBatch(
+  htmlFilePath: string,
+  replies: BatchReplyInput[]
+): { updated: CommentThread[]; missing: string[] } {
+  const state = loadReviewState(htmlFilePath);
+  const updatedMap = new Map<string, CommentThread>();
+  const missing: string[] = [];
+
+  for (const item of replies) {
+    const rawId = String(item.commentId || '').trim();
+    if (!rawId) continue;
+    const thread = state.threads.find((t) => matchesCommentId(t, rawId));
+    if (!thread) {
+      missing.push(rawId);
+      continue;
+    }
+    const author: MessageAuthor = item.author || 'codex';
+    applyReplyToThread(thread, String(item.text || ''), author, item.status);
+    updatedMap.set(thread.id, thread);
+  }
+
+  const updated = Array.from(updatedMap.values());
+  if (updated.length > 0) {
+    saveReviewState(htmlFilePath, state);
+  }
+  return { updated, missing };
 }
 
 export function updateThreadStatus(
@@ -324,7 +368,7 @@ export function formatReviewForCodex(
   lines.push(`---`);
   lines.push(`### How to Respond & Address Comments`);
   lines.push(`1. If a comment asks for a change to the HTML/CSS/content, edit \`${state.htmlFilePath}\` directly.`);
-  lines.push(`2. Reply to each comment using the \`reply_to_comment\` tool (or CLI \`codex-markup reply\`) with the comment ID (e.g. \`c-1\`), explaining what you changed or answering the user's question.`);
+  lines.push(`2. When addressing multiple comments, prefer \`reply_to_comments\` (MCP) or \`codex-markup reply-batch\` (CLI) to submit all replies in one batch request (or use \`reply_to_comment\` / \`reply\` for a single comment).`);
   lines.push(`3. Set status to \`resolved\` when an edit is complete, or \`answered\` when replying to a question or awaiting confirmation.`);
 
   return lines.join('\n');

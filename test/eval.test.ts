@@ -9,6 +9,7 @@ import { PassThrough, Writable } from 'node:stream';
 import { promisify } from 'node:util';
 
 import {
+  addRepliesBatch,
   addReply,
   createThread,
   deleteThread,
@@ -25,6 +26,11 @@ import {
   buildBackgroundCodexInvocation,
   detectSandboxErrorMessage,
   injectReviewWidget,
+  loadAvailableModels,
+  parseCodexModelsCatalog,
+  readCodexConfigDefaultModel,
+  readCodexModelsCache,
+  resolveDefaultModel,
   resolveWorkspaceRoot,
 } from '../src/server.ts';
 import { getWidgetScript } from '../src/widget.ts';
@@ -152,6 +158,32 @@ describe('Suite 1 — Comment Store & Thread Lifecycle', () => {
     assert.equal(addReply(htmlFile, 'c-999', 'Missing', 'codex'), null);
   });
 
+  it('applies batch replies across multiple threads in one atomic store update', () => {
+    const dir = makeTempDir();
+    const htmlFile = makeTempHtml(dir);
+
+    createThread(htmlFile, { mode: 'element', selector: 'h1', tagName: 'h1' }, 'Tighten heading');
+    createThread(htmlFile, { mode: 'element', selector: 'footer', tagName: 'footer' }, 'Is year current?');
+    createThread(htmlFile, { mode: 'element', selector: 'main', tagName: 'main' }, 'Leave untouched');
+
+    const { updated, missing } = addRepliesBatch(htmlFile, [
+      { commentId: '#1', text: 'Updated h1 spacing.', author: 'codex', status: 'resolved' },
+      { commentId: '2', text: 'Yes, 2026 is current.', author: 'codex' },
+      { commentId: 'c-999', text: 'Non-existent target.', author: 'codex' },
+    ]);
+
+    assert.equal(updated.length, 2);
+    assert.deepEqual(missing, ['c-999']);
+
+    const state = loadReviewState(htmlFile);
+    assert.equal(state.threads[0].status, 'resolved');
+    assert.equal(state.threads[0].messages.at(-1)?.text, 'Updated h1 spacing.');
+    assert.equal(state.threads[1].status, 'answered');
+    assert.equal(state.threads[1].messages.at(-1)?.text, 'Yes, 2026 is current.');
+    assert.equal(state.threads[2].status, 'open');
+    assert.equal(state.threads[2].messages.length, 1);
+  });
+
   it('updates thread status, deletes threads, and records submissions', () => {
     const dir = makeTempDir();
     const htmlFile = makeTempHtml(dir);
@@ -255,6 +287,8 @@ describe('Suite 1 — Comment Store & Thread Lifecycle', () => {
     assert.match(allPrompt, /ID: `c-1`/);
     assert.match(allPrompt, /ID: `c-2`/);
     assert.match(allPrompt, /ID: `c-3`/);
+    assert.match(openPrompt, /reply_to_comments/);
+    assert.match(openPrompt, /reply-batch/);
   });
 
   it('wakes up waitForFileSubmission promptly when markSubmitted is called on disk', async () => {
@@ -424,16 +458,28 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
     assert.match(script, /function openThreadPopover\(/);
     assert.match(script, /\.cir-popover/);
 
-    // [✓] Send to Codex toggles in composer & thread reply popover + context-aware sandbox control
+    // [✓] Send to Codex toggles in composer & thread reply popover + context-aware sandbox & model controls
     assert.match(script, /id="cir-send-now"/);
     assert.match(script, /id="cir-pop-send-now"/);
     assert.match(script, /Send to Codex/);
     assert.match(script, /id="cir-dock-sandbox"/);
+    assert.match(script, /id="cir-dock-model"/);
+    assert.match(script, /cir-model-popover/);
+    assert.match(script, /role="listbox"/);
+    assert.match(script, /role="option"/);
+    assert.match(script, /aria-haspopup="listbox"/);
+    assert.match(script, /cir-dock-caret/);
+    assert.equal(script.includes('Current Codex Default'), false);
+    assert.equal(script.includes('Default Model'), false);
     assert.match(script, /toggleSandboxMode/);
+    assert.match(script, /applyModelSelection/);
     assert.match(script, /cir-sandbox-popover/);
     assert.match(script, /Session Sandbox/);
+    assert.match(script, /Session Model/);
     assert.match(script, /Host Sandboxed/);
     assert.match(script, /sandboxInfo/);
+    assert.match(script, /pendingHtmlReload/);
+    assert.match(script, /cir-agent-status-text/);
 
     // Voice dictation
     assert.match(script, /function attachVoiceDictation\(/);
@@ -445,6 +491,7 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
     // SSE event listeners
     assert.match(script, /new EventSource\(SSE_URL\)/);
     assert.match(script, /addEventListener\('comments-updated'/);
+    assert.match(script, /codex-reply-batch/);
     assert.match(script, /addEventListener\('agent-status'/);
     assert.match(script, /addEventListener\('html-updated'/);
   });
@@ -455,6 +502,7 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
     const server = new InlineReviewServer(4321, htmlFile, undefined, {
       env: {},
       requirementsPath: path.join(dir, 'no-requirements.toml'),
+      skipModelDiscovery: true,
     });
 
     try {
@@ -864,15 +912,26 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
       nodeBin: process.execPath,
       cliPath: CLI_ENTRY,
       tmpOutFile: '/tmp/out.txt',
+      inlineHtmlContent: '<h1>Short</h1>',
     });
     assert.equal(fullInvocation.workDir, REPO_ROOT);
     assert.ok(fullInvocation.args.includes('--dangerously-bypass-approvals-and-sandbox'));
     assert.ok(fullInvocation.args.includes('web_search="live"'));
     assert.ok(fullInvocation.args.includes('-C'));
     assert.ok(fullInvocation.args.includes(REPO_ROOT));
+    assert.equal(fullInvocation.args.includes('-m'), false);
+    assert.equal(
+      fullInvocation.args.some((arg) => arg.includes('model_reasoning_effort')),
+      false
+    );
     assert.equal(fullInvocation.agentPrompt.includes('Read ONLY'), false);
     assert.equal(fullInvocation.agentPrompt.includes('Scope strictly to'), false);
     assert.match(fullInvocation.agentPrompt, /Full Access mode/);
+    assert.match(fullInvocation.agentPrompt, /reply-batch/);
+    assert.match(fullInvocation.agentPrompt, /--stdin/);
+    assert.match(fullInvocation.agentPrompt, /Do NOT read external SKILL\.md files/);
+    assert.match(fullInvocation.agentPrompt, /## Current HTML File/);
+    assert.ok(fullInvocation.agentPrompt.includes('<h1>Short</h1>'));
 
     const wsInvocation = buildBackgroundCodexInvocation({
       filePath: repoDemo,
@@ -881,11 +940,20 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
       nodeBin: process.execPath,
       cliPath: CLI_ENTRY,
       tmpOutFile: '/tmp/out.txt',
+      model: 'gpt-5.4',
+      inlineHtmlContent: 'x'.repeat(60_001),
     });
     assert.equal(wsInvocation.workDir, REPO_ROOT);
     const sandboxIdx = wsInvocation.args.indexOf('--sandbox');
     assert.notEqual(sandboxIdx, -1);
     assert.equal(wsInvocation.args[sandboxIdx + 1], 'workspace-write');
+    const modelIdx = wsInvocation.args.indexOf('-m');
+    assert.notEqual(modelIdx, -1);
+    assert.equal(wsInvocation.args[modelIdx + 1], 'gpt-5.4');
+    assert.equal(
+      wsInvocation.args.some((arg) => arg.includes('model_reasoning_effort')),
+      false
+    );
     assert.ok(wsInvocation.args.includes('web_search="disabled"'));
     assert.ok(wsInvocation.args.includes('sandbox_workspace_write.network_access=false'));
     assert.ok(wsInvocation.args.includes('features.apps=false'));
@@ -894,6 +962,8 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
     assert.ok(wsInvocation.args.includes('features.browser_use=false'));
     assert.ok(wsInvocation.args.includes('features.browser_use_external=false'));
     assert.match(wsInvocation.agentPrompt, /workspace-write sandbox mode/);
+    assert.equal(wsInvocation.agentPrompt.includes('## Current HTML File'), false);
+    assert.match(wsInvocation.agentPrompt, /Start by reading/);
 
     const fullWarning = detectSandboxErrorMessage(['sandbox-exec: Operation not permitted'], 'full-access');
     assert.ok(fullWarning);
@@ -907,6 +977,349 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
     assert.ok(epermWarning);
 
     assert.equal(detectSandboxErrorMessage(['Updated styles', 'Done'], 'full-access'), undefined);
+  });
+
+  it('supports batch reply HTTP API, model discovery/selection, and connected-session model locking', async () => {
+    const catalog = parseCodexModelsCatalog(
+      JSON.stringify({
+        models: [
+          { slug: 'hidden-model', display_name: 'Hidden', visibility: 'hide', priority: 1 },
+          { slug: 'second-model', display_name: 'Second Model', visibility: 'list', priority: 20 },
+          { slug: 'first-model', display_name: 'First Model', description: 'Top priority', visibility: 'list', priority: 10 },
+        ],
+      })
+    );
+    assert.deepEqual(catalog, [
+      { slug: 'first-model', displayName: 'First Model', description: 'Top priority' },
+      { slug: 'second-model', displayName: 'Second Model' },
+    ]);
+    assert.deepEqual(parseCodexModelsCatalog('not-json'), []);
+
+    assert.equal(resolveDefaultModel(undefined, {}), null);
+    assert.equal(resolveDefaultModel('default', {}), null);
+    assert.equal(resolveDefaultModel('AUTO', {}), null);
+    assert.equal(resolveDefaultModel('gpt-5.4', {}), 'gpt-5.4');
+    assert.equal(resolveDefaultModel(undefined, { CODEX_MARKUP_MODEL: 'gpt-5' }), 'gpt-5');
+
+    const codexHome = makeTempDir('codex-model-home-');
+    fs.writeFileSync(
+      path.join(codexHome, 'config.toml'),
+      '# user default\nmodel = "gpt-5.4"\n[profiles.fast]\nmodel = "gpt-5-mini"\n',
+      'utf8'
+    );
+    assert.equal(readCodexConfigDefaultModel({ CODEX_HOME: codexHome }), 'gpt-5.4');
+
+    const dir = makeTempDir();
+    const htmlFile = makeTempHtml(dir);
+    createThread(htmlFile, { mode: 'element', selector: 'h1', tagName: 'h1' }, 'Fix title spacing');
+    createThread(htmlFile, { mode: 'element', selector: 'p', tagName: 'p' }, 'Explain metric');
+
+    const server = new InlineReviewServer(4321, htmlFile, undefined, {
+      env: { CODEX_HOME: codexHome },
+      requirementsPath: path.join(dir, 'no-requirements.toml'),
+      skipModelDiscovery: true,
+      availableModels: [{ slug: 'gpt-6-sol', displayName: 'GPT-6 Sol', description: 'Balanced model' }],
+    });
+
+    try {
+      const batchRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'POST',
+          '/__inline_review__/api/reply-batch',
+          { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+          JSON.stringify({
+            file: htmlFile,
+            replies: [
+              { id: '#1', reply: 'Adjusted title margin', status: 'resolved' },
+              { id: '2', text: 'Conversion excludes trials' },
+              { id: 'c-999', text: 'Should be missing' },
+            ],
+          })
+        )
+      );
+      assert.equal(batchRes.statusCode, 200);
+      const batchBody = JSON.parse(batchRes.body);
+      assert.equal(batchBody.ok, true);
+      assert.equal(batchBody.updatedCount, 2);
+      assert.deepEqual(batchBody.missing, ['c-999']);
+      assert.equal(loadReviewState(htmlFile).threads[0].status, 'resolved');
+      assert.equal(loadReviewState(htmlFile).threads[1].status, 'answered');
+
+      const missingBatchRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'POST',
+          '/__inline_review__/api/reply-batch',
+          { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+          JSON.stringify({ file: htmlFile, replies: [{ id: 'c-404', text: 'Missing' }] })
+        )
+      );
+      assert.equal(missingBatchRes.statusCode, 404);
+
+      const healthRes = await dispatchHandleRequest(
+        server,
+        new MockRequest('GET', '/__inline_review__/api/health', { host: '127.0.0.1:4321' })
+      );
+      const healthBody = JSON.parse(healthRes.body);
+      assert.equal(healthBody.model.configuredModel, null);
+      assert.equal(healthBody.model.effectiveModel, 'gpt-5.4');
+      assert.equal(healthBody.model.label, 'gpt-5.4');
+      assert.equal(healthBody.model.canSelect, true);
+      assert.equal(healthBody.model.defaultConfigModel, 'gpt-5.4');
+
+      const selectRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'POST',
+          '/__inline_review__/api/model',
+          { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+          JSON.stringify({ file: htmlFile, model: 'gpt-6-sol' })
+        )
+      );
+      const selectBody = JSON.parse(selectRes.body);
+      assert.equal(selectBody.ok, true);
+      assert.equal(selectBody.applied, true);
+      assert.equal(selectBody.model.configuredModel, 'gpt-6-sol');
+      assert.equal(selectBody.model.label, 'GPT-6 Sol');
+
+      const resetRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'POST',
+          '/__inline_review__/api/model',
+          { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+          JSON.stringify({ file: htmlFile, model: 'default' })
+        )
+      );
+      const resetBody = JSON.parse(resetRes.body);
+      assert.equal(resetBody.ok, true);
+      assert.equal(resetBody.model.configuredModel, null);
+
+      const abortController = new AbortController();
+      const waitPromise = server.waitForSubmission(htmlFile, 5_000, abortController.signal);
+      const waitingStateRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'GET',
+          `/__inline_review__/api/state?file=${encodeURIComponent(htmlFile)}`,
+          { host: '127.0.0.1:4321' }
+        )
+      );
+      const waitingState = JSON.parse(waitingStateRes.body);
+      assert.equal(waitingState.model.canSelect, false);
+      assert.equal(waitingState.model.controlSource, 'connected-session');
+      assert.equal(waitingState.model.label, 'Session Model');
+
+      const blockedModelRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'POST',
+          '/__inline_review__/api/model',
+          { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+          JSON.stringify({ file: htmlFile, model: 'gpt-6-sol' })
+        )
+      );
+      const blockedModelBody = JSON.parse(blockedModelRes.body);
+      assert.equal(blockedModelBody.ok, false);
+      assert.equal(blockedModelBody.applied, false);
+      assert.equal(blockedModelBody.model.controlSource, 'connected-session');
+
+      abortController.abort();
+      await waitPromise;
+
+      const recoveredRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'GET',
+          `/__inline_review__/api/state?file=${encodeURIComponent(htmlFile)}`,
+          { host: '127.0.0.1:4321' }
+        )
+      );
+      const recoveredBody = JSON.parse(recoveredRes.body);
+      assert.equal(recoveredBody.model.canSelect, true);
+      assert.equal(recoveredBody.model.controlSource, 'background-codex');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('discovers valid models with fallback and supports picking different models across API, submit, and Codex invocation', async () => {
+    const dir = makeTempDir('codex-models-fallback-');
+    const htmlFile = makeTempHtml(dir);
+    const cacheHome = path.join(dir, 'cache-home');
+    fs.mkdirSync(cacheHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(cacheHome, 'models_cache.json'),
+      JSON.stringify({
+        models: [
+          { slug: 'gpt-6-luna', display_name: 'GPT-6-Luna', description: 'Fast model', visibility: 'list', priority: 4 },
+          { slug: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol', description: 'Workhorse', visibility: 'list', priority: 1 },
+          { slug: 'secret-hidden', display_name: 'Secret', visibility: 'hide', priority: 0 },
+        ],
+      }),
+      'utf8'
+    );
+    const cachedModels = readCodexModelsCache({ CODEX_HOME: cacheHome });
+    assert.deepEqual(
+      cachedModels.map((m) => m.slug),
+      ['gpt-6.1-sol', 'gpt-6-luna']
+    );
+
+    const blockedHome = path.join(dir, 'blocked-codex-home');
+    const mockCodexBin = path.join(dir, 'mock-codex');
+    fs.writeFileSync(
+      mockCodexBin,
+      [
+        '#!/bin/sh',
+        'if [ "$1" = "debug" ] && [ "$2" = "models" ]; then',
+        `  if [ "$CODEX_HOME" = ${JSON.stringify(blockedHome)} ]; then`,
+        '    echo "Error: Failed to read config file: Operation not permitted" >&2',
+        '    exit 0',
+        '  fi',
+        '  cat <<\'JSON\'',
+        '{"models":[',
+        '  {"slug":"gpt-6-astra","display_name":"GPT-6-Astra","description":"Frontier intelligence","visibility":"list","priority":2},',
+        '  {"slug":"gpt-6.1-sol","display_name":"GPT-6.1-Sol","description":"Latest workhorse","visibility":"list","priority":1},',
+        '  {"slug":"gpt-6-luna","display_name":"GPT-6-Luna","description":"Fast and affordable","visibility":"list","priority":3},',
+        '  {"slug":"codex-hidden","display_name":"Hidden","visibility":"hide","priority":0}',
+        ']}',
+        'JSON',
+        '  exit 0',
+        'fi',
+        'exit 1',
+        '',
+      ].join('\n'),
+      { mode: 0o755 }
+    );
+
+    const discovered = await loadAvailableModels(mockCodexBin, { CODEX_HOME: blockedHome });
+    assert.deepEqual(
+      discovered.map((m) => m.slug),
+      ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna']
+    );
+
+    const server = new InlineReviewServer(4321, htmlFile, undefined, {
+      env: { CODEX_HOME: blockedHome, CODEX_CLI_PATH: mockCodexBin },
+      requirementsPath: path.join(dir, 'no-requirements.toml'),
+    });
+
+    try {
+      const initialStateRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'GET',
+          `/__inline_review__/api/state?file=${encodeURIComponent(htmlFile)}`,
+          { host: '127.0.0.1:4321' }
+        )
+      );
+      const initialState = JSON.parse(initialStateRes.body);
+      assert.equal(initialState.model.configuredModel, null);
+      assert.equal(initialState.model.effectiveModel, 'gpt-6.1-sol');
+      assert.equal(initialState.model.label, 'GPT-6.1-Sol');
+      assert.equal(initialState.model.canSelect, true);
+      assert.deepEqual(
+        initialState.model.availableModels.map((m: { slug: string }) => m.slug),
+        ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-luna']
+      );
+
+      // Pick first model: gpt-6-astra
+      const pickAstraRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'POST',
+          '/__inline_review__/api/model',
+          { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+          JSON.stringify({ file: htmlFile, model: 'gpt-6-astra' })
+        )
+      );
+      const pickAstraBody = JSON.parse(pickAstraRes.body);
+      assert.equal(pickAstraBody.ok, true);
+      assert.equal(pickAstraBody.applied, true);
+      assert.equal(pickAstraBody.model.configuredModel, 'gpt-6-astra');
+      assert.equal(pickAstraBody.model.effectiveModel, 'gpt-6-astra');
+      assert.equal(pickAstraBody.model.label, 'GPT-6-Astra');
+
+      // Switch to a different model: gpt-6-luna
+      const pickLunaRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'POST',
+          '/__inline_review__/api/model',
+          { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+          JSON.stringify({ file: htmlFile, model: 'gpt-6-luna' })
+        )
+      );
+      const pickLunaBody = JSON.parse(pickLunaRes.body);
+      assert.equal(pickLunaBody.ok, true);
+      assert.equal(pickLunaBody.model.configuredModel, 'gpt-6-luna');
+      assert.equal(pickLunaBody.model.effectiveModel, 'gpt-6-luna');
+      assert.equal(pickLunaBody.model.label, 'GPT-6-Luna');
+
+      const stateAfterLunaRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'GET',
+          `/__inline_review__/api/state?file=${encodeURIComponent(htmlFile)}`,
+          { host: '127.0.0.1:4321' }
+        )
+      );
+      const stateAfterLuna = JSON.parse(stateAfterLunaRes.body);
+      assert.equal(stateAfterLuna.model.configuredModel, 'gpt-6-luna');
+      assert.equal(stateAfterLuna.model.effectiveModel, 'gpt-6-luna');
+      assert.equal(stateAfterLuna.model.label, 'GPT-6-Luna');
+
+      const lunaInvocation = buildBackgroundCodexInvocation({
+        filePath: htmlFile,
+        reviewReport: '# Review',
+        sandboxMode: 'full-access',
+        nodeBin: process.execPath,
+        cliPath: CLI_ENTRY,
+        tmpOutFile: path.join(dir, 'out.txt'),
+        model: stateAfterLuna.model.configuredModel,
+      });
+      const lunaIdx = lunaInvocation.args.indexOf('-m');
+      assert.notEqual(lunaIdx, -1);
+      assert.equal(lunaInvocation.args[lunaIdx + 1], 'gpt-6-luna');
+      assert.equal(
+        lunaInvocation.args.some((arg) => arg.includes('model_reasoning_effort')),
+        false
+      );
+
+      // Switch model directly via /submit payload
+      const submitSwitchRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'POST',
+          '/__inline_review__/api/submit',
+          { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+          JSON.stringify({ file: htmlFile, model: 'gpt-6.1-sol', autoRunCodex: false })
+        )
+      );
+      const submitSwitchBody = JSON.parse(submitSwitchRes.body);
+      assert.equal(submitSwitchBody.ok, true);
+      assert.equal(submitSwitchBody.model.configuredModel, 'gpt-6.1-sol');
+      assert.equal(submitSwitchBody.model.effectiveModel, 'gpt-6.1-sol');
+      assert.equal(submitSwitchBody.model.label, 'GPT-6.1-Sol');
+
+      // Reset to resolved default model
+      const resetRes = await dispatchHandleRequest(
+        server,
+        new MockRequest(
+          'POST',
+          '/__inline_review__/api/model',
+          { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+          JSON.stringify({ file: htmlFile, model: null })
+        )
+      );
+      const resetBody = JSON.parse(resetRes.body);
+      assert.equal(resetBody.ok, true);
+      assert.equal(resetBody.model.configuredModel, null);
+      assert.equal(resetBody.model.effectiveModel, 'gpt-6.1-sol');
+      assert.equal(resetBody.model.label, 'GPT-6.1-Sol');
+    } finally {
+      await server.stop();
+    }
   });
 });
 
@@ -1088,12 +1501,19 @@ async function verifyMcpSession(framing: FramingMode): Promise<void> {
     const pingRes = await client.request('ping');
     assert.deepEqual(pingRes.result, {});
 
-    // tools/list -> all 5 tools
+    // tools/list -> all 6 tools
     const listRes = await client.request('tools/list');
     const tools = (listRes.result?.tools as Array<{ name: string }>) || [];
     assert.deepEqual(
       tools.map((t) => t.name),
-      ['open_html_review', 'wait_for_review', 'get_inline_comments', 'reply_to_comment', 'resolve_comment']
+      [
+        'open_html_review',
+        'wait_for_review',
+        'get_inline_comments',
+        'reply_to_comment',
+        'reply_to_comments',
+        'resolve_comment',
+      ]
     );
 
     // open_html_review (non-blocking, no browser launch)
@@ -1157,17 +1577,35 @@ async function verifyMcpSession(framing: FramingMode): Promise<void> {
     assert.match(waitText, /Check spacing after reload/);
     assert.match(waitText, /Triggered via sidecar on disk/);
     assert.match(waitText, /ID: `c-2`/);
+
+    // reply_to_comments batch across multiple threads
+    createThread(htmlFile, { mode: 'element', selector: 'footer', tagName: 'footer' }, 'Update footer copyright');
+    const batchMcpRes = await client.request('tools/call', {
+      name: 'reply_to_comments',
+      arguments: {
+        file_path: htmlFile,
+        replies: [
+          { comment_id: 'c-2', reply: 'Adjusted container gap to 24px.', status: 'resolved' },
+          { comment_id: 'c-3', reply: 'Year is up to date.', status: 'answered' },
+        ],
+      },
+    });
+    const batchMcpText = ((batchMcpRes.result?.content as Array<{ text: string }>) || [])[0]?.text || '';
+    assert.match(batchMcpText, /Replied to 2 comment\(s\) in batch \(c-2:resolved, c-3:answered\)/);
+    const stateAfterMcpBatch = loadReviewState(htmlFile);
+    assert.equal(stateAfterMcpBatch.threads.find((t) => t.id === 'c-2')?.status, 'resolved');
+    assert.equal(stateAfterMcpBatch.threads.find((t) => t.id === 'c-3')?.status, 'answered');
   } finally {
     await client.close();
   }
 }
 
 describe('Suite 3 — MCP Server Protocol & Tool Execution', () => {
-  it('handles newline-delimited JSON-RPC lifecycle, all 5 tools, and disk-triggered wait_for_review', async () => {
+  it('handles newline-delimited JSON-RPC lifecycle, all 6 tools, and disk-triggered wait_for_review', async () => {
     await verifyMcpSession('line');
   });
 
-  it('handles Content-Length framed JSON-RPC lifecycle, all 5 tools, and disk-triggered wait_for_review', async () => {
+  it('handles Content-Length framed JSON-RPC lifecycle, all 6 tools, and disk-triggered wait_for_review', async () => {
     await verifyMcpSession('content-length');
   });
 });
@@ -1202,7 +1640,7 @@ describe('Suite 4 — CLI End-to-End Evaluation', () => {
     fs.writeFileSync(agentsPath, '# Custom User Instructions\nKeep diffs minimal.\n', 'utf8');
 
     const firstInstall = await runCli(['install', '--codex-home', codexHome]);
-    assert.match(firstInstall.stdout, /✓ Verified MCP server \(5 tools:/);
+    assert.match(firstInstall.stdout, /✓ Verified MCP server \(6 tools:/);
     assert.match(firstInstall.stdout, /STATUS: OK/);
 
     const configAfterFirst = fs.readFileSync(configPath, 'utf8');
@@ -1297,6 +1735,64 @@ describe('Suite 4 — CLI End-to-End Evaluation', () => {
     assert.match(listAll.stdout, /Inline Comments \(2 total\)/);
     const listOpen3 = await runCli(['comments', htmlFile, '--status', 'open']);
     assert.match(listOpen3.stdout, /Inline Comments \(2 open\)/);
+
+    const batchJsonRes = await runCli([
+      'reply-batch',
+      htmlFile,
+      '--json',
+      JSON.stringify([
+        { id: 'c-1', reply: 'Batch JSON reply for c-1', status: 'answered' },
+        { id: '#2', reply: 'Batch JSON reply for c-2', status: 'resolved' },
+        { id: 'c-999', reply: 'Missing target thread' },
+      ]),
+    ]);
+    assert.match(batchJsonRes.stdout, /Replied to 2 comment\(s\) in batch/);
+    assert.match(batchJsonRes.stderr, /Missing comment ID\(s\): c-999/);
+    const stateAfterJsonBatch = loadReviewState(htmlFile);
+    assert.equal(stateAfterJsonBatch.threads[0].status, 'answered');
+    assert.equal(stateAfterJsonBatch.threads[1].status, 'resolved');
+
+    const stdinOutput = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        ['--no-warnings', CLI_ENTRY, 'reply-batch', htmlFile, '--stdin', '--resolve'],
+        {
+          cwd: REPO_ROOT,
+          env: {
+            ...process.env,
+            CODEX_REVIEW_PORT: '99999',
+          },
+        }
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString();
+      });
+      child.on('error', reject);
+      child.on('close', (code) => {
+        if (code !== 0) {
+          reject(new Error(`reply-batch --stdin exited ${code}: ${stderr || stdout}`));
+        } else {
+          resolve({ stdout, stderr });
+        }
+      });
+      child.stdin.write(
+        JSON.stringify([
+          { id: 'c-1', reply: 'Resolved c-1 via stdin' },
+          { id: 'c-2', reply: 'Resolved c-2 via stdin' },
+        ])
+      );
+      child.stdin.end();
+    });
+    assert.match(stdinOutput.stdout, /Replied to 2 comment\(s\) in batch/);
+    const stateAfterStdinBatch = loadReviewState(htmlFile);
+    assert.equal(stateAfterStdinBatch.threads[0].status, 'resolved');
+    assert.equal(stateAfterStdinBatch.threads[1].status, 'resolved');
+    assert.equal(stateAfterStdinBatch.threads[0].messages.at(-1)?.text, 'Resolved c-1 via stdin');
   });
 
   it('supports --copy runtime relocation, doctor verification, and clean uninstall round-trip', async () => {

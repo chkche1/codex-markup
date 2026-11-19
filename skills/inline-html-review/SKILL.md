@@ -19,7 +19,7 @@ Call the `open_html_review` MCP tool:
 - `open_browser`: `true`
 - `wait_for_submission`: set to `true` if you want to immediately wait for the user to add inline comments and click **"🚀 Submit to Codex"** in the browser.
 
-> **Permissions note:** When Codex is actively listening via `wait_for_review` or `open_html_review(wait_for_submission: true)` (or CLI `wait`), execution permissions come from the connected Codex session itself, and the browser dock displays a read-only **Session Sandbox** badge.
+> **Permissions & model note:** When Codex is actively listening via `wait_for_review` or `open_html_review(wait_for_submission: true)` (or CLI `wait`), execution permissions and model selection come from the connected Codex session itself, and the browser dock displays read-only **Session Sandbox** and **Session Model** badges.
 
 #### If using CLI commands (without MCP):
 ```bash
@@ -54,9 +54,15 @@ Each comment thread includes:
 
 For each open inline comment:
 1. **If the comment requests a code/design/text change:** Edit the `.html` file directly. The browser preview will automatically live-reload via Server-Sent Events (SSE).
-2. **Reply to the comment thread** so the user sees your explanation or answer directly inside the browser thread card:
-   - **Via MCP:** Call `reply_to_comment(file_path, comment_id="c-1", reply="...", status="resolved")` (use `"answered"` if answering a question where follow-up might be needed, or `"resolved"` if the requested change is complete).
-   - **Via CLI:**
+2. **Reply to all addressed comment threads together (preferred for batches)** or individually so the user sees your explanation directly inside each browser thread card:
+   - **Via MCP (batch):** Call `reply_to_comments(file_path, replies=[{"comment_id": "c-1", "reply": "...", "status": "resolved"}, ...])` to update multiple threads in one request (or use `reply_to_comment` for a single comment; use `"answered"` if follow-up might be needed, or `"resolved"` if the requested change is complete).
+   - **Via CLI (batch):**
+     ```bash
+     node --no-warnings <path-to-codex-markup>/src/cli.ts reply-batch <path/to/file.html> --stdin <<'EOF'
+     [{"id":"c-1","reply":"Updated the CTA button gradient and increased padding.","status":"resolved"}]
+     EOF
+     ```
+   - **Via CLI (single comment):**
      ```bash
      node --no-warnings <path-to-codex-markup>/src/cli.ts reply <path/to/file.html> c-1 "Updated the CTA button gradient and increased padding." --resolve
      ```

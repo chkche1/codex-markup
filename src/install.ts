@@ -8,6 +8,7 @@ export const EXPECTED_MCP_TOOLS = [
   'wait_for_review',
   'get_inline_comments',
   'reply_to_comment',
+  'reply_to_comments',
   'resolve_comment',
 ];
 
@@ -695,7 +696,7 @@ export async function installForCodex(options?: InstallOptions): Promise<Install
     `Whenever you generate or update an HTML file/artifact for the user, or when the user asks to preview an HTML page or address inline comments:`,
     `1. Call the \`open_html_review\` MCP tool with \`file_path\` to open the live browser preview with inline text & DOM commenting.`,
     `2. Call \`wait_for_review\` (or pass \`wait_for_submission: true\` to \`open_html_review\`) to wait for the user to click **"🚀 Submit to Codex"** in the browser, or call \`get_inline_comments\` when asked to check comments.`,
-    `3. Edit the HTML file to address each comment and call \`reply_to_comment\` with \`comment_id\` (e.g. \`c-1\`), your explanation/answer, and \`status: "resolved"\` (or \`"answered"\` for questions).`,
+    `3. Edit the HTML file to address each comment and reply using \`reply_to_comments\` (for multiple comments in one batch) or \`reply_to_comment\` (for a single thread) with \`comment_id\` (e.g. \`c-1\`), your explanation/answer, and \`status: "resolved"\` (or \`"answered"\` for questions).`,
     AGENTS_MARKER_END,
   ].join('\n');
 

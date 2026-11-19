@@ -14,7 +14,7 @@ Requires **Node.js 22.18+ (22.x) or 24+**, and Git or `curl` + `tar`. To have Co
 curl -fsSL https://raw.githubusercontent.com/chkche1/codex-markup/main/install.sh | bash
 ```
 
-The installer downloads to `~/.codex/tools/codex-markup`, registers the MCP server, installs the skill and review instructions, and verifies all five MCP tools. No `npm install` is needed. Restart Codex when it finishes.
+The installer downloads to `~/.codex/tools/codex-markup`, registers the MCP server, installs the skill and review instructions, and verifies all six MCP tools. No `npm install` is needed. Restart Codex when it finishes.
 
 Re-run the same command to update. The download is checked before replacing the current installation; a failed installation restores the previous runtime and configuration. The installer prints download time, setup timings, and commands for your installed paths.
 
@@ -54,7 +54,7 @@ This opens the example dashboard with the review overlay. The server stays runni
 3. Click **Submit to Codex** when your queued feedback is ready.
 4. Watch the preview update and read Codex's replies in the threads.
 
-When a Codex session is listening through MCP, feedback returns to that session under its permissions. Otherwise, the server starts a background Codex CLI run. Standalone runs default to **Full Access**, bypassing sandbox and approval restrictions. Add `--sandbox workspace-write` to the `serve` command to restrict access. The toolbar shows the active mode; host sandboxing and managed policies may lock it.
+When a Codex session is listening through MCP, feedback returns to that session under its permissions and model. Otherwise, the server starts a background Codex CLI run. Standalone runs default to **Full Access**, bypassing sandbox and approval restrictions, and inherit your current Codex model and reasoning settings. Add `--sandbox workspace-write` or `--model <slug>` to `serve` (or switch them from the toolbar) for standalone runs; host sandboxing, managed policies, or connected MCP sessions lock toolbar overrides.
 
 Voice input is available when your browser supports speech recognition.
 
@@ -72,7 +72,7 @@ Once installed (see [Install](#install) above), restart your Codex session to lo
 
 > Open page.html for inline review, wait for my comments, and address them.
 
-The integration provides five tools:
+The integration provides six tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -80,6 +80,7 @@ The integration provides five tools:
 | `wait_for_review` | Wait for submitted feedback. |
 | `get_inline_comments` | Read review threads. |
 | `reply_to_comment` | Reply and update a thread's status. |
+| `reply_to_comments` | Reply to multiple threads in one batch. |
 | `resolve_comment` | Resolve or reopen a thread. |
 
 ## Verify, update, or remove

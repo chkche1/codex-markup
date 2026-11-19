@@ -7,11 +7,13 @@ import {
   loadReviewState,
   createThread,
   addReply,
+  addRepliesBatch,
   updateThreadStatus,
   deleteThread,
   markSubmitted,
   formatReviewForCodex,
   getSidecarPath,
+  type BatchReplyInput,
   type CommentTarget,
   type CommentStatus,
   type MessageAuthor,
@@ -40,9 +42,173 @@ export interface SandboxCapabilities {
   restartCommand?: string;
 }
 
+export interface ModelOption {
+  slug: string;
+  displayName: string;
+  description?: string;
+}
+
+export interface ModelCapabilities {
+  configuredModel: string | null;
+  effectiveModel: string | null;
+  defaultConfigModel?: string;
+  controlSource: 'background-codex' | 'connected-session';
+  canSelect: boolean;
+  label: string;
+  reason: string;
+  hint?: string;
+  availableModels: ModelOption[];
+}
+
 export interface InlineReviewServerOptions {
   env?: NodeJS.ProcessEnv;
   requirementsPath?: string;
+  model?: string | null;
+  availableModels?: ModelOption[];
+  skipModelDiscovery?: boolean;
+}
+
+export function normalizeModelSelection(model?: string | null): string | null {
+  if (typeof model !== 'string') return null;
+  const trimmed = model.trim();
+  const lower = trimmed.toLowerCase();
+  if (!trimmed || lower === 'default' || lower === 'auto') {
+    return null;
+  }
+  return trimmed;
+}
+
+export function resolveDefaultModel(
+  model?: string | null,
+  env: NodeJS.ProcessEnv = process.env
+): string | null {
+  if (model !== undefined) {
+    return normalizeModelSelection(model);
+  }
+  return normalizeModelSelection(env.CODEX_MARKUP_MODEL);
+}
+
+export function readCodexConfigDefaultModel(
+  env: NodeJS.ProcessEnv = process.env
+): string | undefined {
+  try {
+    const codexHome = env.CODEX_HOME
+      ? path.resolve(env.CODEX_HOME)
+      : path.join(os.homedir(), '.codex');
+    const configPath = path.join(codexHome, 'config.toml');
+    if (!fs.existsSync(configPath)) return undefined;
+    const raw = fs.readFileSync(configPath, 'utf8');
+    const stripped = raw.replace(/#.*$/gm, '');
+    const topSectionIdx = stripped.search(/^\s*\[/m);
+    const topLevel = topSectionIdx === -1 ? stripped : stripped.slice(0, topSectionIdx);
+    const match = topLevel.match(/^\s*model\s*=\s*(?:"([^"]+)"|'([^']+)')/m);
+    const val = match ? (match[1] || match[2] || '').trim() : '';
+    return val || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function parseCodexModelsCatalog(rawJson: string): ModelOption[] {
+  try {
+    const parsed = JSON.parse(rawJson) as {
+      models?: Array<{
+        slug?: string;
+        display_name?: string;
+        description?: string;
+        visibility?: string;
+        priority?: number;
+      }>;
+    };
+    if (!parsed || !Array.isArray(parsed.models)) return [];
+    return parsed.models
+      .filter((m) => m && typeof m.slug === 'string' && m.visibility === 'list')
+      .sort(
+        (a, b) =>
+          (typeof a.priority === 'number' ? a.priority : 999) -
+          (typeof b.priority === 'number' ? b.priority : 999)
+      )
+      .map((m) => ({
+        slug: String(m.slug),
+        displayName: String(m.display_name || m.slug),
+        ...(m.description ? { description: String(m.description) } : {}),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function findCodexBin(env: NodeJS.ProcessEnv): string {
+  const candidateCodexBins = [
+    env.CODEX_CLI_PATH,
+    '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+    '/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+    '/Applications/Codex.app/Contents/Resources/codex',
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+  ].filter((p): p is string => Boolean(p));
+
+  return candidateCodexBins.find((p) => fs.existsSync(p)) || 'codex';
+}
+
+export function readCodexModelsCache(env: NodeJS.ProcessEnv = process.env): ModelOption[] {
+  try {
+    const codexHome = env.CODEX_HOME
+      ? path.resolve(env.CODEX_HOME)
+      : path.join(os.homedir(), '.codex');
+    const cachePath = path.join(codexHome, 'models_cache.json');
+    if (!fs.existsSync(cachePath)) return [];
+    const raw = fs.readFileSync(cachePath, 'utf8');
+    return parseCodexModelsCatalog(raw);
+  } catch {
+    return [];
+  }
+}
+
+function execModelsCatalog(codexBin: string, runEnv: NodeJS.ProcessEnv): Promise<ModelOption[]> {
+  return new Promise((resolve) => {
+    execFile(
+      codexBin,
+      ['debug', 'models'],
+      { env: runEnv, timeout: 5000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err || !stdout) {
+          resolve([]);
+          return;
+        }
+        resolve(parseCodexModelsCatalog(stdout));
+      }
+    );
+  });
+}
+
+export async function loadAvailableModels(
+  codexBin: string,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<ModelOption[]> {
+  const direct = await execModelsCatalog(codexBin, env);
+  if (direct.length > 0) {
+    return direct;
+  }
+
+  let tmpCodexHome: string | undefined;
+  try {
+    tmpCodexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-models-'));
+    return await execModelsCatalog(codexBin, {
+      ...env,
+      CODEX_HOME: tmpCodexHome,
+    });
+  } catch {
+    return [];
+  } finally {
+    if (tmpCodexHome) {
+      try {
+        fs.rmSync(tmpCodexHome, { recursive: true, force: true });
+      } catch {
+        // Ignore temp dir cleanup errors
+      }
+    }
+  }
 }
 
 export function detectExternalSandbox(
@@ -142,6 +308,8 @@ export function buildBackgroundCodexInvocation(opts: {
   nodeBin: string;
   cliPath: string;
   tmpOutFile: string;
+  model?: string | null;
+  inlineHtmlContent?: string;
 }): { workDir: string; args: string[]; agentPrompt: string } {
   const resolved = path.resolve(opts.filePath);
   const workDir = resolveWorkspaceRoot(resolved);
@@ -167,12 +335,16 @@ export function buildBackgroundCodexInvocation(opts: {
           'features.browser_use_external=false',
         ];
 
+  const normalizedModel = normalizeModelSelection(opts.model);
+  const modelArgs = normalizedModel ? ['-m', normalizedModel] : [];
+
   const args = [
     'exec',
     '--ephemeral',
     '-c',
     'mcp_servers={}',
     ...sandboxArgs,
+    ...modelArgs,
     '--skip-git-repo-check',
     '-C',
     workDir,
@@ -181,6 +353,13 @@ export function buildBackgroundCodexInvocation(opts: {
     '-',
   ];
 
+  const hasInlineHtml =
+    typeof opts.inlineHtmlContent === 'string' && opts.inlineHtmlContent.length <= 60_000;
+
+  const instruction1 = hasInlineHtml
+    ? `1. The current HTML file is included above (${resolved}); only re-read from disk if you need additional context.`
+    : `1. Start by reading ${resolved} to understand the context of each open comment.`;
+
   const instruction2 =
     opts.sandboxMode === 'full-access'
       ? `2. Edit ${resolved} (and any related files requested by the comments) directly.`
@@ -188,22 +367,39 @@ export function buildBackgroundCodexInvocation(opts: {
 
   const instruction4 =
     opts.sandboxMode === 'full-access'
-      ? `4. You are running in Full Access mode (workspace root: ${workDir}). If an inline comment asks you to inspect other local files, reference project code, fetch web assets, or run commands, you may do so directly. Avoid unrelated repository builds or test suites unless an inline comment asks for them.`
-      : `4. You are running in workspace-write sandbox mode (writable root: ${workDir}, network disabled). Focus on ${resolved} and related files in ${workDir}; do NOT run unrelated repository builds or test suites unless a comment asks for them. If a comment requires network access or writes outside ${workDir} that your sandbox blocks, explain that clearly in your inline reply.`;
+      ? `4. You are running in Full Access mode (workspace root: ${workDir}). If an inline comment asks you to inspect other local files, reference project code, fetch web assets, or run commands, you may do so directly. Avoid unrelated repository builds or test suites unless an inline comment asks for them. Do NOT read external SKILL.md files (all reply instructions are already provided above).`
+      : `4. You are running in workspace-write sandbox mode (writable root: ${workDir}, network disabled). Focus on ${resolved} and related files in ${workDir}; do NOT run unrelated repository builds or test suites unless a comment asks for them. If a comment requires network access or writes outside ${workDir} that your sandbox blocks, explain that clearly in your inline reply. Do NOT read external SKILL.md files (all reply instructions are already provided above).`;
 
-  const agentPrompt = [
+  const promptSections = [
     `You are responding to inline review comments left by the user on the HTML file: ${resolved}`,
     ``,
     opts.reviewReport,
+  ];
+
+  if (hasInlineHtml) {
+    promptSections.push(
+      ``,
+      `## Current HTML File (${resolved})`,
+      `\`\`\`html`,
+      opts.inlineHtmlContent as string,
+      `\`\`\``
+    );
+  }
+
+  promptSections.push(
     ``,
     `IMPORTANT INSTRUCTIONS:`,
-    `1. Start by reading ${resolved} to understand the context of each open comment.`,
+    instruction1,
     instruction2,
-    `3. For EVERY open comment thread listed above, you MUST post your reply back to the inline thread by running:`,
-    `   ${opts.nodeBin} --no-warnings ${opts.cliPath} reply ${JSON.stringify(resolved)} <comment-id> "<your detailed answer or summary of changes>" --resolve`,
-    `   (Omit --resolve if you are only answering a question and want to keep the thread open/answered for follow-up.)`,
-    instruction4,
-  ].join('\n');
+    `3. Reply to ALL open comment threads in ONE single batch command (do NOT run separate reply commands per comment):`,
+    `   ${opts.nodeBin} --no-warnings ${opts.cliPath} reply-batch ${JSON.stringify(resolved)} --stdin <<'EOF'`,
+    `   [{"id":"c-1","reply":"<your detailed answer or summary of changes>","status":"resolved"}]`,
+    `   EOF`,
+    `   (Use "status":"resolved" when a requested edit is complete, or "status":"answered" when answering a question.)`,
+    instruction4
+  );
+
+  const agentPrompt = promptSections.join('\n');
 
   return { workDir, args, agentPrompt };
 }
@@ -267,6 +463,76 @@ const MIME_TYPES: Record<string, string> = {
   '.ttf': 'font/ttf',
 };
 
+function formatAgentStatusPhase(line: string): string | null {
+  if (
+    !line ||
+    /^[-=*_]{3,}$/.test(line) ||
+    /^(<|\/?>|\.|#|\{|\}|\/\*|\*\/|--)(\s|$|[a-zA-Z0-9_-])/.test(line) ||
+    /^(OpenAI Codex|workdir:|model:|provider:|approval:|sandbox:|reasoning |session id:|tokens used$|succeeded in |warning:)/i.test(
+      line
+    ) ||
+    /\/bin\/(z?sh|bash)\b.*\bcat\b/.test(line) ||
+    /^\d[\d,]*$/.test(line)
+  ) {
+    return null;
+  }
+  if (/^web search:|search_service\.web_run/i.test(line)) {
+    return 'Searching web...';
+  }
+  if (/\breply-batch\b|\bcli\.ts\s+reply\b/.test(line)) {
+    return 'Posting replies...';
+  }
+  if (/^exec$/i.test(line) || /^\/bin\/(z?sh|bash)\b/.test(line)) {
+    return 'Running command...';
+  }
+  if (/^codex$/i.test(line)) {
+    return 'Drafting response...';
+  }
+  const snippet = line.length > 72 ? line.slice(0, 69) + '...' : line;
+  return `Codex: ${snippet}`;
+}
+
+function parseFallbackRepliesFromMessage(
+  lastMessage: string
+): Array<{ commentId: string; text: string; status?: CommentStatus }> | null {
+  let raw = lastMessage.trim();
+  const fenceMatch = raw.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  if (fenceMatch) {
+    raw = fenceMatch[1].trim();
+  }
+  if (!raw.startsWith('[') && !raw.startsWith('{')) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const arr = Array.isArray(parsed)
+      ? parsed
+      : parsed &&
+          typeof parsed === 'object' &&
+          Array.isArray((parsed as { replies?: unknown }).replies)
+        ? (parsed as { replies: unknown[] }).replies
+        : null;
+    if (!arr) return null;
+    const items: Array<{ commentId: string; text: string; status?: CommentStatus }> = [];
+    for (const entry of arr) {
+      if (!entry || typeof entry !== 'object') continue;
+      const rec = entry as Record<string, unknown>;
+      const commentId = String(rec.commentId ?? rec.comment_id ?? rec.id ?? '').trim();
+      const text = String(rec.text ?? rec.reply ?? '').trim();
+      const status =
+        rec.status === 'open' || rec.status === 'answered' || rec.status === 'resolved'
+          ? rec.status
+          : undefined;
+      if (commentId && text) {
+        items.push({ commentId, text, status });
+      }
+    }
+    return items.length > 0 ? items : null;
+  } catch {
+    return null;
+  }
+}
+
 export class InlineReviewServer {
   private server: http.Server;
   private port: number;
@@ -274,8 +540,14 @@ export class InlineReviewServer {
   private sseClients = new Set<SSEClient>();
   private waiters = new Set<PendingWaiter>();
   private watchedFiles = new Map<string, fs.FSWatcher>();
-  private activeCodexRuns = new Map<string, { startedAt: string; statusText: string }>();
+  private activeCodexRuns = new Map<string, { startedAt: string; statusText: string; queued?: boolean }>();
+  private pendingCodexRerun = new Set<string>();
+  private lastInternalSidecarWrite = new Map<string, number>();
   private sandboxMode: CodexSandboxMode;
+  private selectedModel: string | null;
+  private defaultConfigModel?: string;
+  private availableModels: ModelOption[] = [];
+  private modelsReadyPromise: Promise<void> = Promise.resolve();
   private env: NodeJS.ProcessEnv;
   private requirementsPath?: string;
 
@@ -289,6 +561,31 @@ export class InlineReviewServer {
     this.env = options?.env ?? process.env;
     this.requirementsPath = options?.requirementsPath;
     this.sandboxMode = resolveDefaultSandboxMode(sandboxMode, this.env, this.requirementsPath);
+    this.selectedModel = resolveDefaultModel(options?.model, this.env);
+    this.defaultConfigModel = readCodexConfigDefaultModel(this.env);
+    if (options?.availableModels) {
+      this.availableModels = options.availableModels;
+    } else if (!options?.skipModelDiscovery && Object.keys(this.env).length > 0) {
+      const cached = readCodexModelsCache(this.env);
+      if (cached.length > 0) {
+        this.availableModels = cached;
+      }
+      const codexBin = findCodexBin(this.env);
+      this.modelsReadyPromise = loadAvailableModels(codexBin, {
+        ...this.env,
+        PATH: `/opt/homebrew/bin:/usr/local/bin:${this.env.PATH || '/usr/bin:/bin'}`,
+      }).then((models) => {
+        if (models.length > 0) {
+          this.availableModels = models;
+          if (this.activeFilePath) {
+            this.broadcastSSE(this.activeFilePath, 'comments-updated', {
+              reason: 'model-changed',
+              model: this.getModelCapabilities(this.activeFilePath),
+            });
+          }
+        }
+      });
+    }
     if (initialFile) {
       this.setActiveFile(initialFile);
     }
@@ -319,6 +616,52 @@ export class InlineReviewServer {
       return `http://127.0.0.1:${this.port}/`;
     }
     return `http://127.0.0.1:${this.port}/review?file=${encodeURIComponent(target)}`;
+  }
+
+  public getModelCapabilities(filePath?: string | null): ModelCapabilities {
+    const targetFile = filePath ? path.resolve(filePath) : this.activeFilePath;
+    const waitingCount = targetFile ? this.getWaitersCount(targetFile) : this.waiters.size;
+
+    if (waitingCount > 0) {
+      return {
+        configuredModel: this.selectedModel,
+        effectiveModel: null,
+        ...(this.defaultConfigModel ? { defaultConfigModel: this.defaultConfigModel } : {}),
+        controlSource: 'connected-session',
+        canSelect: false,
+        label: 'Session Model',
+        reason:
+          'Model selection is owned by your connected Codex CLI/Desktop session. MCP does not allow an external server to change the host Codex session model.',
+        hint:
+          'Switch models directly in Codex Desktop/CLI, or submit when no session is listening to pick a model for standalone background runs.',
+        availableModels: this.availableModels,
+      };
+    }
+
+    const resolvedDefault = this.defaultConfigModel || this.availableModels[0]?.slug || null;
+    const effectiveModel = this.selectedModel || resolvedDefault;
+    const matchedOption = effectiveModel
+      ? this.availableModels.find((m) => m.slug === effectiveModel)
+      : undefined;
+    const label = matchedOption?.displayName || effectiveModel || 'Codex Model';
+    const slugNote =
+      matchedOption && effectiveModel && matchedOption.displayName.toLowerCase() !== effectiveModel.toLowerCase()
+        ? ` (${effectiveModel})`
+        : '';
+    const reason = effectiveModel
+      ? `Standalone background Codex will answer using ${label}${slugNote}. Click to switch models.`
+      : 'Standalone background Codex will answer using your active Codex configuration. Click to switch models.';
+
+    return {
+      configuredModel: this.selectedModel,
+      effectiveModel,
+      ...(this.defaultConfigModel ? { defaultConfigModel: this.defaultConfigModel } : {}),
+      controlSource: 'background-codex',
+      canSelect: true,
+      label,
+      reason,
+      availableModels: this.availableModels,
+    };
   }
 
   public getSandboxCapabilities(filePath?: string | null): SandboxCapabilities {
@@ -510,6 +853,7 @@ export class InlineReviewServer {
     this.broadcastSSE(filePath, 'waiters-updated', {
       waitingAgentsCount: count,
       sandbox: this.getSandboxCapabilities(filePath),
+      model: this.getModelCapabilities(filePath),
     });
   }
 
@@ -525,7 +869,40 @@ export class InlineReviewServer {
 
   private ensureWatching(htmlFilePath: string) {
     const resolved = path.resolve(htmlFilePath);
-    if (!this.watchedFiles.has(resolved) && fs.existsSync(resolved)) {
+    const sidecar = getSidecarPath(resolved);
+    const dir = path.dirname(resolved);
+    const sidecarBase = path.basename(sidecar);
+    const htmlBase = path.basename(resolved);
+    const dirWatchKey = `dir:${dir}:${htmlBase}:${sidecarBase}`;
+
+    if (!this.watchedFiles.has(dirWatchKey) && fs.existsSync(dir)) {
+      let sidecarDebounce: NodeJS.Timeout | null = null;
+      let htmlDebounce: NodeJS.Timeout | null = null;
+      try {
+        const watcher = fs.watch(dir, (_eventType, filename) => {
+          if (filename === sidecarBase) {
+            if (Date.now() - (this.lastInternalSidecarWrite.get(resolved) || 0) < 350) {
+              return;
+            }
+            if (sidecarDebounce) clearTimeout(sidecarDebounce);
+            sidecarDebounce = setTimeout(() => {
+              this.broadcastSSE(resolved, 'comments-updated', { reason: 'file-sync' });
+            }, 100);
+          } else if (filename === htmlBase) {
+            if (htmlDebounce) clearTimeout(htmlDebounce);
+            htmlDebounce = setTimeout(() => {
+              this.broadcastSSE(resolved, 'html-updated', { filePath: resolved, timestamp: Date.now() });
+            }, 120);
+          }
+        });
+        this.watchedFiles.set(dirWatchKey, watcher);
+        return;
+      } catch {
+        // Fallback to direct file watch below
+      }
+    }
+
+    if (!this.watchedFiles.has(dirWatchKey) && !this.watchedFiles.has(resolved) && fs.existsSync(resolved)) {
       let debounceTimer: NodeJS.Timeout | null = null;
       try {
         const watcher = fs.watch(resolved, () => {
@@ -535,32 +912,6 @@ export class InlineReviewServer {
           }, 120);
         });
         this.watchedFiles.set(resolved, watcher);
-      } catch {
-        // Ignore watch errors
-      }
-    }
-
-    const sidecar = getSidecarPath(resolved);
-    const dir = path.dirname(resolved);
-    const sidecarBase = path.basename(sidecar);
-    const dirWatchKey = `dir:${dir}:${sidecarBase}`;
-    if (!this.watchedFiles.has(dirWatchKey) && fs.existsSync(dir)) {
-      let debounceTimer: NodeJS.Timeout | null = null;
-      try {
-        const watcher = fs.watch(dir, (_eventType, filename) => {
-          if (filename === sidecarBase) {
-            if (debounceTimer) clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => {
-              this.broadcastSSE(resolved, 'comments-updated', { reason: 'file-sync' });
-            }, 100);
-          } else if (filename === path.basename(resolved)) {
-            if (debounceTimer) clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => {
-              this.broadcastSSE(resolved, 'html-updated', { filePath: resolved, timestamp: Date.now() });
-            }, 120);
-          }
-        });
-        this.watchedFiles.set(dirWatchKey, watcher);
       } catch {
         // Ignore watch errors
       }
@@ -700,21 +1051,40 @@ export class InlineReviewServer {
     res.end('Not Found');
   }
 
+  private async waitForModelsReady(maxWaitMs = 2500): Promise<void> {
+    if (this.availableModels.length > 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this.modelsReadyPromise,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, maxWaitMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   private async handleApi(req: http.IncomingMessage, res: http.ServerResponse, url: URL) {
     const endpoint = url.pathname.replace('/__inline_review__/api', '');
 
     if (endpoint === '/health' && req.method === 'GET') {
+      await this.waitForModelsReady();
       this.sendJson(res, 200, {
         ok: true,
         port: this.port,
         activeFilePath: this.activeFilePath,
         sandboxMode: this.sandboxMode,
         sandbox: this.getSandboxCapabilities(this.activeFilePath),
+        model: this.getModelCapabilities(this.activeFilePath),
       });
       return;
     }
 
     if (endpoint === '/state' && req.method === 'GET') {
+      await this.waitForModelsReady();
       const file = this.resolveRequestedFile(url.searchParams.get('file'));
       const state = loadReviewState(file);
       this.sendJson(res, 200, {
@@ -723,6 +1093,7 @@ export class InlineReviewServer {
         codexRun: this.activeCodexRuns.get(file) || null,
         sandboxMode: this.sandboxMode,
         sandbox: this.getSandboxCapabilities(file),
+        model: this.getModelCapabilities(file),
       });
       return;
     }
@@ -753,6 +1124,7 @@ export class InlineReviewServer {
       const target = body.target as CommentTarget;
       const text = String(body.text || '');
       const author = ((body.author as MessageAuthor) || 'user');
+      this.lastInternalSidecarWrite.set(file, Date.now());
       const thread = createThread(file, target, text, author);
       this.logEvent(`[API /comments] file=${file} id=${thread.id} author=${author} text=${JSON.stringify(text)}`);
       this.broadcastSSE(file, 'comments-updated', { reason: 'new-comment', commentId: thread.id, number: thread.number });
@@ -766,6 +1138,7 @@ export class InlineReviewServer {
       const text = String(body.text || '');
       const author = ((body.author as MessageAuthor) || 'codex');
       const status = body.status as CommentStatus | undefined;
+      this.lastInternalSidecarWrite.set(file, Date.now());
       const thread = addReply(file, commentId, text, author, status);
       if (!thread) {
         this.logEvent(`[API /reply] 404 file=${file} id=${commentId}`);
@@ -782,10 +1155,59 @@ export class InlineReviewServer {
       return;
     }
 
+    if (endpoint === '/reply-batch' && req.method === 'POST') {
+      const file = this.resolveRequestedFile(body.file as string);
+      if (!Array.isArray(body.replies)) {
+        this.sendJson(res, 400, { ok: false, error: 'Missing replies array' });
+        return;
+      }
+      const normalized: BatchReplyInput[] = body.replies
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === 'object'))
+        .map((r) => ({
+          commentId: String(r.commentId ?? r.comment_id ?? r.id ?? ''),
+          text: String(r.text ?? r.reply ?? ''),
+          author: ((r.author as MessageAuthor) || 'codex'),
+          status: r.status as CommentStatus | undefined,
+        }))
+        .filter((r) => r.commentId.trim().length > 0);
+
+      this.lastInternalSidecarWrite.set(file, Date.now());
+      const { updated, missing } = addRepliesBatch(file, normalized);
+      if (normalized.length > 0 && updated.length === 0) {
+        this.logEvent(`[API /reply-batch] 404 file=${file} missing=${missing.join(',')}`);
+        this.sendJson(res, 404, {
+          ok: false,
+          error: `No matching comments found (${missing.join(', ')})`,
+          missing,
+        });
+        return;
+      }
+
+      this.logEvent(
+        `[API /reply-batch] file=${file} updated=${updated.length} missing=${missing.length}`
+      );
+      if (updated.length > 0) {
+        this.broadcastSSE(file, 'comments-updated', {
+          reason: 'codex-reply-batch',
+          count: updated.length,
+          commentIds: updated.map((t) => t.id),
+          numbers: updated.map((t) => t.number),
+        });
+      }
+      this.sendJson(res, 200, {
+        ok: true,
+        threads: updated,
+        updatedCount: updated.length,
+        missing,
+      });
+      return;
+    }
+
     if (endpoint === '/status' && req.method === 'POST') {
       const file = this.resolveRequestedFile(body.file as string);
       const commentId = String(body.commentId || '');
       const status = (body.status as CommentStatus) || 'resolved';
+      this.lastInternalSidecarWrite.set(file, Date.now());
       const thread = updateThreadStatus(file, commentId, status);
       if (!thread) {
         this.logEvent(`[API /status] 404 file=${file} id=${commentId}`);
@@ -806,6 +1228,7 @@ export class InlineReviewServer {
     if (endpoint === '/delete' && req.method === 'POST') {
       const file = this.resolveRequestedFile(body.file as string);
       const commentId = String(body.commentId || '');
+      this.lastInternalSidecarWrite.set(file, Date.now());
       const deleted = deleteThread(file, commentId);
       this.broadcastSSE(file, 'comments-updated', { reason: 'deleted', commentId });
       this.sendJson(res, 200, { ok: deleted });
@@ -853,6 +1276,42 @@ export class InlineReviewServer {
       return;
     }
 
+    if (endpoint === '/model' && req.method === 'POST') {
+      const targetFile = typeof body.file === 'string' ? this.setActiveFile(body.file) : this.activeFilePath;
+      const currentCaps = this.getModelCapabilities(targetFile);
+      if (!currentCaps.canSelect) {
+        this.logEvent(
+          `[API /model] Blocked change (controlSource=${currentCaps.controlSource}, selectedModel=${this.selectedModel ?? 'default'})`
+        );
+        this.sendJson(res, 200, {
+          ok: false,
+          applied: false,
+          error: currentCaps.reason,
+          model: currentCaps,
+        });
+        return;
+      }
+
+      const requested =
+        body.model === null || typeof body.model === 'string' ? body.model : undefined;
+      this.selectedModel = normalizeModelSelection(requested);
+      const nextCaps = this.getModelCapabilities(targetFile);
+      this.logEvent(`[API /model] selectedModel=${this.selectedModel ?? 'default'}`);
+      if (targetFile) {
+        const resolved = this.setActiveFile(targetFile);
+        this.broadcastSSE(resolved, 'comments-updated', {
+          reason: 'model-changed',
+          model: nextCaps,
+        });
+      }
+      this.sendJson(res, 200, {
+        ok: true,
+        applied: true,
+        model: nextCaps,
+      });
+      return;
+    }
+
     if (endpoint === '/submit' && req.method === 'POST') {
       const file = this.resolveRequestedFile(body.file as string);
       const capsBefore = this.getSandboxCapabilities(file);
@@ -862,6 +1321,12 @@ export class InlineReviewServer {
             ? 'full-access'
             : 'workspace-write';
       }
+      if (body.model !== undefined && this.getModelCapabilities(file).canSelect) {
+        this.selectedModel = normalizeModelSelection(
+          body.model === null || typeof body.model === 'string' ? body.model : undefined
+        );
+      }
+      this.lastInternalSidecarWrite.set(file, Date.now());
       const state = markSubmitted(file, body.generalNote as string | undefined);
       const prompt = formatReviewForCodex(file, 'open');
 
@@ -877,13 +1342,15 @@ export class InlineReviewServer {
       // If no active MCP `wait_for_review` call is blocking, automatically spawn `codex exec`
       // in the background so the user always gets their inline comments answered!
       let spawnedCodex = false;
+      let queued = false;
       const openThreads = state.threads.filter((t) => t.status === 'open');
       this.logEvent(
         `[API /submit] file=${file} openCount=${openThreads.length} notifiedWaiters=${notifiedWaiters} autoRunCodex=${body.autoRunCodex !== false}`
       );
       if (notifiedWaiters === 0 && openThreads.length > 0 && body.autoRunCodex !== false) {
-        spawnedCodex = true;
-        this.runBackgroundCodex(file, openThreads.map((t) => t.id));
+        const outcome = this.runBackgroundCodex(file, openThreads.map((t) => t.id));
+        spawnedCodex = outcome === 'spawned';
+        queued = outcome === 'queued';
       }
 
       this.sendJson(res, 200, {
@@ -892,7 +1359,9 @@ export class InlineReviewServer {
         prompt,
         notifiedWaiters,
         spawnedCodex,
+        queued,
         sandbox: this.getSandboxCapabilities(file),
+        model: this.getModelCapabilities(file),
       });
       return;
     }
@@ -931,11 +1400,15 @@ export class InlineReviewServer {
     this.sendJson(res, 404, { error: `Unknown API endpoint: ${endpoint}` });
   }
 
-  private runBackgroundCodex(filePath: string, openThreadIds: string[]) {
+  private runBackgroundCodex(filePath: string, openThreadIds: string[]): 'spawned' | 'queued' {
     const resolved = path.resolve(filePath);
-    if (this.activeCodexRuns.has(resolved)) {
-      this.logEvent(`[runBackgroundCodex] Skipping spawn; run already active for ${resolved}`);
-      return;
+    const existingRun = this.activeCodexRuns.get(resolved);
+    if (existingRun) {
+      this.pendingCodexRerun.add(resolved);
+      existingRun.queued = true;
+      this.logEvent(`[runBackgroundCodex] Queued follow-up batch for ${resolved}`);
+      this.broadcastSSE(resolved, 'agent-status', { running: true, ...existingRun });
+      return 'queued';
     }
 
     const runState = {
@@ -945,16 +1418,7 @@ export class InlineReviewServer {
     this.activeCodexRuns.set(resolved, runState);
     this.broadcastSSE(resolved, 'agent-status', { running: true, ...runState });
 
-    const candidateCodexBins = [
-      this.env.CODEX_CLI_PATH,
-      '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
-      '/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
-      '/Applications/Codex.app/Contents/Resources/codex',
-      '/opt/homebrew/bin/codex',
-      '/usr/local/bin/codex',
-    ].filter((p): p is string => Boolean(p));
-
-    const codexBin = candidateCodexBins.find((p) => fs.existsSync(p)) || 'codex';
+    const codexBin = findCodexBin(this.env);
 
     const nodeBin = fs.existsSync('/opt/homebrew/bin/node')
       ? '/opt/homebrew/bin/node'
@@ -963,6 +1427,18 @@ export class InlineReviewServer {
     const cliPath = path.resolve(import.meta.dirname || '.', 'cli.ts');
     const tmpOutFile = path.join(os.tmpdir(), `codex-inline-reply-${Date.now()}.txt`);
     const reviewReport = formatReviewForCodex(resolved, 'open');
+
+    let inlineHtmlContent: string | undefined;
+    try {
+      if (fs.existsSync(resolved)) {
+        const rawHtml = fs.readFileSync(resolved, 'utf8');
+        if (rawHtml.length <= 60_000) {
+          inlineHtmlContent = rawHtml;
+        }
+      }
+    } catch {
+      // Ignore inline read error; Codex can still read from disk
+    }
 
     const beforeReplyCounts = new Map<string, number>();
     const initialState = loadReviewState(resolved);
@@ -981,6 +1457,8 @@ export class InlineReviewServer {
       nodeBin,
       cliPath,
       tmpOutFile,
+      model: this.selectedModel,
+      inlineHtmlContent,
     });
 
     const env = {
@@ -989,7 +1467,7 @@ export class InlineReviewServer {
     };
 
     this.logEvent(
-      `[runBackgroundCodex] Spawning ${codexBin} for ${resolved} (sandboxMode=${effectiveRunMode}, workDir=${workDir}, threads=${openThreadIds.join(',')}, promptBytes=${Buffer.byteLength(agentPrompt, 'utf8')})`
+      `[runBackgroundCodex] Spawning ${codexBin} for ${resolved} (sandboxMode=${effectiveRunMode}, model=${this.selectedModel ?? 'default'}, workDir=${workDir}, threads=${openThreadIds.join(',')}, promptBytes=${Buffer.byteLength(agentPrompt, 'utf8')})`
     );
 
     const child = spawn(codexBin, args, {
@@ -1000,6 +1478,7 @@ export class InlineReviewServer {
 
     let lastErrorLine = '';
     const collectedLines: string[] = [];
+    let lastStatusBroadcastAt = Date.now();
 
     const handleStreamChunk = (source: 'stdout' | 'stderr', chunk: Buffer) => {
       const text = chunk.toString('utf8');
@@ -1018,10 +1497,12 @@ export class InlineReviewServer {
         } else {
           console.log(`[${new Date().toISOString()}] [codex-exec stdout] ${line}`);
         }
-        const snippet = line.length > 90 ? line.slice(0, 87) + '...' : line;
+        const phaseText = formatAgentStatusPhase(line);
         const active = this.activeCodexRuns.get(resolved);
-        if (active) {
-          active.statusText = `Codex: ${snippet}`;
+        const now = Date.now();
+        if (active && phaseText && phaseText !== active.statusText && now - lastStatusBroadcastAt >= 300) {
+          active.statusText = phaseText;
+          lastStatusBroadcastAt = now;
           this.broadcastSSE(resolved, 'agent-status', { running: true, ...active });
         }
       }
@@ -1037,6 +1518,7 @@ export class InlineReviewServer {
     child.on('error', (err) => {
       console.error(`[${new Date().toISOString()}] [InlineReviewServer] Failed to spawn codex exec:`, err);
       this.activeCodexRuns.delete(resolved);
+      this.pendingCodexRerun.delete(resolved);
       this.broadcastSSE(resolved, 'agent-status', {
         running: false,
         error: `Failed to launch codex CLI: ${err.message}`,
@@ -1063,23 +1545,69 @@ export class InlineReviewServer {
           `[runBackgroundCodex] codex exec exited code=${code} signal=${signal ?? 'none'} lastMessageLength=${lastMessage.length}`
         );
 
-        // Fallback: if Codex answered in its final output without invoking `reply`
-        // on any of the open threads, attach its response automatically so the user always sees it!
+        // Fallback: if Codex answered in its final output without invoking `reply-batch` / `reply`
+        // on any of the open threads, attach its response automatically in one batch write.
         if (lastMessage) {
           const afterState = loadReviewState(resolved);
-          for (const threadId of openThreadIds) {
+          const unRepliedIds = openThreadIds.filter((threadId) => {
             const thread = afterState.threads.find((t) => t.id === threadId);
             const prevCount = beforeReplyCounts.get(threadId) || 0;
-            if (thread && thread.messages.length <= prevCount) {
-              const targetStatus = thread.status === 'open' ? 'answered' : thread.status;
-              const updated = addReply(resolved, threadId, lastMessage, 'codex', targetStatus);
-              if (updated) {
-                this.logEvent(`[runBackgroundCodex] Attached fallback reply to ${updated.id} (status=${updated.status})`);
-                this.broadcastSSE(resolved, 'comments-updated', {
-                  reason: 'codex-reply',
-                  commentId: updated.id,
-                  number: updated.number,
+            return Boolean(thread && thread.messages.length <= prevCount);
+          });
+
+          if (unRepliedIds.length > 0) {
+            const parsedReplies = parseFallbackRepliesFromMessage(lastMessage);
+            const batchInputs: BatchReplyInput[] = [];
+            if (parsedReplies) {
+              for (const item of parsedReplies) {
+                const thread = afterState.threads.find(
+                  (t) => t.id === item.commentId || `c-${t.number}` === item.commentId || String(t.number) === item.commentId
+                );
+                if (thread && unRepliedIds.includes(thread.id)) {
+                  batchInputs.push({
+                    commentId: thread.id,
+                    text: item.text,
+                    author: 'codex',
+                    status: item.status || (thread.status === 'open' ? 'answered' : thread.status),
+                  });
+                }
+              }
+            } else {
+              for (const threadId of unRepliedIds) {
+                const thread = afterState.threads.find((t) => t.id === threadId);
+                if (!thread) continue;
+                batchInputs.push({
+                  commentId: threadId,
+                  text: lastMessage,
+                  author: 'codex',
+                  status: thread.status === 'open' ? 'answered' : thread.status,
                 });
+              }
+            }
+
+            if (batchInputs.length > 0) {
+              this.lastInternalSidecarWrite.set(resolved, Date.now());
+              const { updated } = addRepliesBatch(resolved, batchInputs);
+              if (updated.length > 0) {
+                this.logEvent(
+                  `[runBackgroundCodex] Attached ${updated.length} fallback reply(ies) (${updated.map((t) => t.id).join(', ')})`
+                );
+                this.broadcastSSE(
+                  resolved,
+                  'comments-updated',
+                  updated.length === 1
+                    ? {
+                        reason: 'codex-reply',
+                        commentId: updated[0].id,
+                        number: updated[0].number,
+                      }
+                    : {
+                        reason: 'codex-reply-batch',
+                        count: updated.length,
+                        commentIds: updated.map((t) => t.id),
+                        numbers: updated.map((t) => t.number),
+                      }
+                );
               }
             }
           }
@@ -1095,8 +1623,19 @@ export class InlineReviewServer {
           error: lastErrorLine || (code !== 0 ? `Codex exited with code ${code}` : undefined),
           ...(sandboxWarning ? { sandboxWarning } : {}),
         });
+        if (this.pendingCodexRerun.delete(resolved)) {
+          const latestState = loadReviewState(resolved);
+          const remainingOpenIds = latestState.threads
+            .filter((t) => t.status === 'open')
+            .map((t) => t.id);
+          if (remainingOpenIds.length > 0) {
+            this.runBackgroundCodex(resolved, remainingOpenIds);
+          }
+        }
       }
     });
+
+    return 'spawned';
   }
 
   private resolveRequestedFile(fileParam?: string | null): string {

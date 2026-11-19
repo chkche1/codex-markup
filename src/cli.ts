@@ -6,8 +6,10 @@ import {
   DEFAULT_PORT,
   InlineReviewServer,
   ensureReviewServer,
+  normalizeModelSelection,
   openInBrowser,
   resolveDefaultSandboxMode,
+  type ModelCapabilities,
   type SandboxCapabilities,
 } from './server.ts';
 import { startMcpServer } from './mcp.ts';
@@ -16,8 +18,10 @@ import {
   formatReviewForCodex,
   createThread,
   addReply,
+  addRepliesBatch,
   updateThreadStatus,
   waitForFileSubmission,
+  type BatchReplyInput,
   type CommentStatus,
   type CommentTarget,
 } from './store.ts';
@@ -68,6 +72,7 @@ COMMANDS:
   comments <file.html>            Print inline comments for an HTML file (--status open|all|resolved)
   add-comment <file.html> <text>  Add an inline comment (--selector "body" --tag "body")
   reply <file.html> <id> <text>   Reply to a comment thread from Codex (--resolve to mark resolved)
+  reply-batch <file.html> [<json>] Reply to multiple comment threads in one batch (--json <json> | --stdin)
   resolve <file.html> <id>        Mark a comment thread as resolved (--reopen to reopen)
   restart [file.html]             Restart the local review server (and trigger review if file given)
   install                         Configure ~/.codex/config.toml, skill, and AGENTS.md for Codex Desktop & CLI
@@ -78,10 +83,12 @@ COMMANDS:
 OPTIONS:
   -p, --port <number>             Port for local review server (default: ${DEFAULT_PORT})
   --sandbox <mode>                Background codex exec mode: full-access (default when unsandboxed) | workspace-write
+  --model <slug>                  Background codex exec model override (default: current Codex config)
   --codex-home <dir>              Custom Codex configuration directory (default: ~/.codex)
   --copy                          Copy runtime to <codex-home>/tools/codex-markup on install
   --install-dir <dir>             Explicit runtime destination directory on install (implies --copy)
-  --json                          Print an installation result as JSON (install only)
+  --json                          JSON payload (reply-batch) or JSON output (install)
+  --stdin                         Read JSON replies array from stdin (reply-batch)
   --no-verify                     Skip post-install MCP verification in 'install'
   --no-open                       Do not automatically open the browser on 'serve'
   -h, --help                      Show this help message
@@ -110,6 +117,38 @@ function printSandboxStatus(caps?: SandboxCapabilities) {
       `🔒 Background Codex mode: workspace-write (root: ${caps.workspaceRoot}; pass --sandbox full-access for unrestricted access)`
     );
   }
+}
+
+function printModelStatus(caps?: ModelCapabilities) {
+  if (!caps) return;
+  if (caps.controlSource === 'connected-session') {
+    console.log('🧠 Connected Codex session controls the active model while listening.');
+  } else if (caps.effectiveModel) {
+    const slugNote =
+      caps.label.toLowerCase() !== caps.effectiveModel.toLowerCase()
+        ? ` (${caps.effectiveModel})`
+        : '';
+    console.log(
+      `🧠 Background Codex model: ${caps.label}${slugNote} (pass --model <slug> to switch)`
+    );
+  } else {
+    console.log(
+      '🧠 Background Codex model: active Codex CLI configuration (pass --model <slug> to switch)'
+    );
+  }
+}
+
+async function readStdinText(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    process.stdin.on('data', (chunk: Buffer | string) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8'));
+    });
+    process.stdin.on('end', () => {
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    process.stdin.on('error', reject);
+  });
 }
 
 function printSetup() {
@@ -151,6 +190,11 @@ async function main() {
     typeof flags.sandbox === 'string' ? resolveDefaultSandboxMode(flags.sandbox) : undefined;
   if (sandboxMode) {
     process.env.CODEX_MARKUP_SANDBOX = sandboxMode;
+  }
+  const hasExplicitModel = typeof flags.model === 'string';
+  const modelOverride = hasExplicitModel ? normalizeModelSelection(String(flags.model)) : undefined;
+  if (hasExplicitModel) {
+    process.env.CODEX_MARKUP_MODEL = modelOverride ?? 'default';
   }
 
   if (flags.help || cmd === 'help') {
@@ -238,6 +282,7 @@ async function main() {
     if (targetFile) args.push(targetFile);
     args.push('--port', String(port), '--no-open');
     if (sandboxMode) args.push('--sandbox', sandboxMode);
+    if (hasExplicitModel) args.push('--model', modelOverride ?? 'default');
 
     const logFile = path.join(os.tmpdir(), `codex-inline-review-${port}.log`);
     fs.writeFileSync(logFile, `=== Server Restarted at ${new Date().toISOString()} ===\n`, 'utf8');
@@ -249,13 +294,13 @@ async function main() {
     child.unref();
 
     const baseUrl = `http://127.0.0.1:${port}`;
-    let healthData: { sandbox?: SandboxCapabilities } | undefined;
+    let healthData: { sandbox?: SandboxCapabilities; model?: ModelCapabilities } | undefined;
     for (let i = 0; i < 25; i++) {
       await new Promise((r) => setTimeout(r, 150));
       try {
         const res = await fetch(`${baseUrl}/__inline_review__/api/health`);
         if (res.ok) {
-          healthData = (await res.json()) as { sandbox?: SandboxCapabilities };
+          healthData = (await res.json()) as { sandbox?: SandboxCapabilities; model?: ModelCapabilities };
           break;
         }
       } catch {
@@ -264,6 +309,7 @@ async function main() {
     }
     console.log(`✨ Restarted Codex Inline Review Server on ${baseUrl} (PID ${child.pid}, logs: ${logFile})`);
     printSandboxStatus(healthData?.sandbox);
+    printModelStatus(healthData?.model);
 
     if (targetFile) {
       const submitRes = await fetch(`${baseUrl}/__inline_review__/api/submit`, {
@@ -295,11 +341,12 @@ async function main() {
     const shouldOpen = !flags['no-open'];
 
     try {
-      const srv = new InlineReviewServer(port, targetFile, sandboxMode);
+      const srv = new InlineReviewServer(port, targetFile, sandboxMode, { model: modelOverride });
       const actualPort = await srv.start();
       const reviewUrl = srv.getReviewUrl(targetFile);
       console.log(`✨ Codex Inline Review Server running at: http://127.0.0.1:${actualPort}`);
       printSandboxStatus(srv.getSandboxCapabilities(targetFile));
+      printModelStatus(srv.getModelCapabilities(targetFile));
       if (targetFile) {
         console.log(`📄 Reviewing HTML file: ${targetFile}`);
         console.log(`🔗 Review URL: ${reviewUrl}`);
@@ -335,12 +382,34 @@ async function main() {
           } else {
             printSandboxStatus(sandboxData.sandbox);
           }
-        } else {
+        }
+        if (hasExplicitModel) {
+          const modelRes = await fetch(`${baseUrl}/__inline_review__/api/model`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file: targetFile, model: modelOverride }),
+          });
+          const modelData = (await modelRes.json()) as {
+            applied?: boolean;
+            error?: string;
+            model?: ModelCapabilities;
+          };
+          if (modelData.applied === false) {
+            console.warn(`⚠️ Could not change model on existing server: ${modelData.error}`);
+          } else {
+            printModelStatus(modelData.model);
+          }
+        }
+        if (!sandboxMode || !hasExplicitModel) {
           try {
             const healthRes = await fetch(`${baseUrl}/__inline_review__/api/health`);
             if (healthRes.ok) {
-              const healthData = (await healthRes.json()) as { sandbox?: SandboxCapabilities };
-              printSandboxStatus(healthData.sandbox);
+              const healthData = (await healthRes.json()) as {
+                sandbox?: SandboxCapabilities;
+                model?: ModelCapabilities;
+              };
+              if (!sandboxMode) printSandboxStatus(healthData.sandbox);
+              if (!hasExplicitModel) printModelStatus(healthData.model);
             }
           } catch {
             // Ignore health check failure
@@ -473,6 +542,106 @@ async function main() {
       process.exit(1);
     }
     console.log(`✓ Replied to ${thread.id} (status: ${thread.status}).`);
+    return;
+  }
+
+  if (cmd === 'reply-batch') {
+    const targetFile = positional[1];
+    if (!targetFile) {
+      console.error('Usage: codex-markup reply-batch <file.html> [<json>] [--json <json> | --stdin]');
+      process.exit(1);
+    }
+    const resolvedFile = path.resolve(targetFile);
+    let rawJson = '';
+    if (typeof flags.json === 'string') {
+      rawJson = flags.json;
+    } else {
+      const positionalJson = positional.slice(2).join(' ').trim();
+      if (positionalJson) {
+        rawJson = positionalJson;
+      } else if (flags.stdin || !process.stdin.isTTY) {
+        rawJson = await readStdinText();
+      }
+    }
+
+    if (!rawJson.trim()) {
+      console.error('Error: Missing JSON replies payload. Pass --json "[...]" or pipe via --stdin.');
+      process.exit(1);
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawJson);
+    } catch (err) {
+      console.error(`Error: Invalid JSON payload: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+
+    const rawEntries = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === 'object' && Array.isArray((parsed as { replies?: unknown }).replies)
+        ? (parsed as { replies: unknown[] }).replies
+        : null;
+
+    if (!rawEntries) {
+      console.error('Error: JSON payload must be an array of replies or { "replies": [...] }.');
+      process.exit(1);
+    }
+
+    const defaultStatus: CommentStatus = flags.resolve
+      ? 'resolved'
+      : ((flags.status as CommentStatus) || 'answered');
+
+    const normalized: BatchReplyInput[] = rawEntries
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === 'object'))
+      .map((r) => ({
+        commentId: String(r.commentId ?? r.comment_id ?? r.id ?? '').trim(),
+        text: String(r.text ?? r.reply ?? ''),
+        author: 'codex' as const,
+        status: (r.status as CommentStatus | undefined) || defaultStatus,
+      }))
+      .filter((r) => r.commentId.length > 0);
+
+    if (normalized.length === 0) {
+      console.error('Error: No valid reply entries found in batch payload.');
+      process.exit(1);
+    }
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/__inline_review__/api/reply-batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: resolvedFile, replies: normalized }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          threads?: Array<{ id: string; status: string }>;
+          updatedCount?: number;
+          missing?: string[];
+        };
+        const ids = (data.threads || []).map((t) => `${t.id} (${t.status})`).join(', ');
+        console.log(
+          `✓ Replied to ${data.updatedCount ?? (data.threads || []).length} comment(s) in batch (${ids}) and updated live browser view.`
+        );
+        if (data.missing && data.missing.length > 0) {
+          console.warn(`⚠️ Missing comment ID(s): ${data.missing.join(', ')}`);
+        }
+        return;
+      }
+    } catch {
+      // Fallback to direct store write if server isn't running
+    }
+
+    const { updated, missing } = addRepliesBatch(resolvedFile, normalized);
+    if (updated.length === 0) {
+      console.error(`Error: No matching comments found (${missing.join(', ')}).`);
+      process.exit(1);
+    }
+    const ids = updated.map((t) => `${t.id} (${t.status})`).join(', ');
+    console.log(`✓ Replied to ${updated.length} comment(s) in batch (${ids}).`);
+    if (missing.length > 0) {
+      console.warn(`⚠️ Missing comment ID(s): ${missing.join(', ')}`);
+    }
     return;
   }
 

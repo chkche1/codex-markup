@@ -6,8 +6,10 @@ import {
 import {
   formatReviewForCodex,
   addReply,
+  addRepliesBatch,
   updateThreadStatus,
   waitForFileSubmission,
+  type BatchReplyInput,
   type CommentStatus,
 } from './store.ts';
 
@@ -109,6 +111,45 @@ const TOOLS = [
         },
       },
       required: ['file_path', 'comment_id', 'reply'],
+    },
+  },
+  {
+    name: 'reply_to_comments',
+    description:
+      'Posts replies from Codex to multiple inline comment threads in one batch request and updates their statuses ("answered" or "resolved"). Immediately pushes all updates to the browser review UI.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file_path: {
+          type: 'string',
+          description: 'Path to the HTML file.',
+        },
+        replies: {
+          type: 'array',
+          description: 'List of replies to post in one atomic batch.',
+          items: {
+            type: 'object',
+            properties: {
+              comment_id: {
+                type: 'string',
+                description: 'ID of the comment thread (e.g. "c-1" or "1").',
+              },
+              reply: {
+                type: 'string',
+                description: 'Your response answering the user\'s question or explaining the change made.',
+              },
+              status: {
+                type: 'string',
+                enum: ['answered', 'resolved', 'open'],
+                description:
+                  'New status for the thread: use "resolved" when a requested edit is finished, or "answered" when replying to a question.',
+              },
+            },
+            required: ['comment_id', 'reply'],
+          },
+        },
+      },
+      required: ['file_path', 'replies'],
     },
   },
   {
@@ -280,6 +321,63 @@ export async function startMcpServer(port = DEFAULT_PORT): Promise<void> {
           throw new Error(`Comment ${commentId} not found in ${resolvedFile}`);
         }
         return `Replied to comment ${thread.id} (status: ${thread.status}).`;
+      }
+    }
+
+    if (name === 'reply_to_comments') {
+      if (!Array.isArray(args.replies) || args.replies.length === 0) {
+        throw new Error('Missing or empty required parameter: replies');
+      }
+      const normalized: BatchReplyInput[] = args.replies
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === 'object'))
+        .map((r) => ({
+          commentId: String(r.comment_id ?? r.commentId ?? r.id ?? ''),
+          text: String(r.reply ?? r.text ?? ''),
+          author: 'codex',
+          status: (r.status as CommentStatus | undefined) || 'answered',
+        }))
+        .filter((r) => r.commentId.trim().length > 0);
+
+      if (normalized.length === 0) {
+        throw new Error('No valid reply items provided in replies array');
+      }
+
+      try {
+        const { baseUrl } = await ensureReviewServer(port, resolvedFile);
+        const res = await fetch(`${baseUrl}/__inline_review__/api/reply-batch`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            file: resolvedFile,
+            replies: normalized,
+          }),
+        });
+        const data = (await res.json()) as {
+          ok: boolean;
+          error?: string;
+          threads?: Array<{ id: string; status: string }>;
+          updatedCount?: number;
+          missing?: string[];
+        };
+        if (!data.ok) {
+          throw new Error(data.error || 'Failed to post batch replies');
+        }
+        const ids = (data.threads || []).map((t) => `${t.id}:${t.status}`).join(', ');
+        const missingNote =
+          data.missing && data.missing.length > 0
+            ? ` (missing: ${data.missing.join(', ')})`
+            : '';
+        return `Replied to ${data.updatedCount ?? (data.threads || []).length} comment(s) in batch (${ids}) and updated live browser view.${missingNote}`;
+      } catch {
+        const { updated, missing } = addRepliesBatch(resolvedFile, normalized);
+        if (updated.length === 0) {
+          throw new Error(
+            `No matching comments found in ${resolvedFile}${missing.length ? ` (${missing.join(', ')})` : ''}`
+          );
+        }
+        const ids = updated.map((t) => `${t.id}:${t.status}`).join(', ');
+        const missingNote = missing.length > 0 ? ` (missing: ${missing.join(', ')})` : '';
+        return `Replied to ${updated.length} comment(s) in batch (${ids}).${missingNote}`;
       }
     }
 

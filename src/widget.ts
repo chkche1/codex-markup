@@ -30,6 +30,11 @@ export function getWidgetScript(filePath: string): string {
   let sandboxMode = 'full-access';
   let sandboxInfo = null;
   let sandboxPopoverOpen = false;
+  let modelInfo = null;
+  let selectedModel = null;
+  let modelPopoverOpen = false;
+  let pendingHtmlReload = false;
+  let isSubmitting = false;
   let sendToCodexImmediately = true;
   let popoverMode = null; // null | 'compose' | 'thread'
   let activeRecognition = null;
@@ -557,6 +562,115 @@ export function getWidgetScript(filePath: string): string {
       word-break: break-all;
       margin-bottom: 8px;
     }
+    .cir-dock-caret {
+      font-size: 10px;
+      opacity: 0.75;
+      margin-left: 2px;
+    }
+    .cir-model-popover {
+      position: fixed;
+      width: 320px;
+      max-width: calc(100vw - 32px);
+      background: #1e1e20;
+      color: #f4f4f5;
+      border-radius: 12px;
+      box-shadow: 0 16px 40px rgba(0,0,0,0.48), 0 0 0 1px rgba(255,255,255,0.12);
+      padding: 8px;
+      pointer-events: auto;
+      z-index: 2147483647;
+      display: none;
+      overflow: hidden;
+    }
+    .cir-model-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 6px 8px 6px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      margin-bottom: 6px;
+    }
+    .cir-model-list {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      max-height: min(380px, 60vh);
+      overflow-y: auto;
+      padding-right: 2px;
+    }
+    .cir-model-item {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      border: 1px solid transparent;
+      color: #e4e4e7;
+      border-radius: 8px;
+      padding: 7px 9px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      transition: border-color 0.12s ease, background 0.12s ease;
+    }
+    .cir-model-item:hover {
+      border-color: rgba(255,255,255,0.1);
+      background: rgba(255,255,255,0.08);
+    }
+    .cir-model-item.active {
+      border-color: rgba(99, 102, 241, 0.75);
+      background: rgba(99, 102, 241, 0.18);
+      color: #fff;
+    }
+    .cir-model-item-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .cir-model-item-name {
+      font-size: 12.5px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+    .cir-model-item-slug {
+      font-size: 10.5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #a1a1aa;
+      flex-shrink: 0;
+    }
+    .cir-model-item-desc {
+      font-size: 11px;
+      color: #a1a1aa;
+      line-height: 1.3;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .cir-model-custom-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 8px 2px 2px;
+      border-top: 1px solid rgba(255,255,255,0.08);
+    }
+    .cir-model-input {
+      flex: 1;
+      min-width: 0;
+      background: #111113;
+      border: 1px solid #3f3f46;
+      border-radius: 7px;
+      padding: 5px 9px;
+      color: #f4f4f5;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      outline: none;
+    }
+    .cir-model-input:focus {
+      border-color: #6366f1;
+    }
     .cir-dock-submit {
       background: linear-gradient(135deg, #4f46e5, #7c3aed);
       color: #fff;
@@ -818,6 +932,9 @@ export function getWidgetScript(filePath: string): string {
   const sandboxPopover = document.createElement('div');
   sandboxPopover.className = 'cir-sandbox-popover';
 
+  const modelPopover = document.createElement('div');
+  modelPopover.className = 'cir-model-popover';
+
   const dock = document.createElement('div');
   dock.className = 'cir-dock';
 
@@ -832,6 +949,7 @@ export function getWidgetScript(filePath: string): string {
   shadow.appendChild(selectionPill);
   shadow.appendChild(popover);
   shadow.appendChild(sandboxPopover);
+  shadow.appendChild(modelPopover);
   shadow.appendChild(dock);
   shadow.appendChild(sidebar);
   shadow.appendChild(toast);
@@ -1368,10 +1486,11 @@ export function getWidgetScript(filePath: string): string {
         closePopover();
       }
 
-      await fetchState();
       if (shouldSendNow) {
+        saveBtn.textContent = 'Sending...';
         await submitReviewToCodex();
       } else {
+        await fetchState();
         showToast('💬 Inline comment saved');
       }
     };
@@ -1508,10 +1627,10 @@ export function getWidgetScript(filePath: string): string {
         status: 'open'
       });
       replyInput.value = '';
-      await fetchState();
       if (shouldSendNow) {
         await submitReviewToCodex();
       } else {
+        await fetchState();
         showToast('Reply added');
       }
     };
@@ -1693,16 +1812,229 @@ export function getWidgetScript(filePath: string): string {
     }
   }
 
+  function getEffectiveModelView() {
+    if (modelInfo && typeof modelInfo === 'object') {
+      const configuredModel = modelInfo.configuredModel || null;
+      const defaultCfg = modelInfo.defaultConfigModel || '';
+      const available = Array.isArray(modelInfo.availableModels) ? modelInfo.availableModels : [];
+      const effectiveModel =
+        modelInfo.effectiveModel || configuredModel || defaultCfg || (available[0] ? available[0].slug : null);
+      const matched = effectiveModel ? available.find((m) => m.slug === effectiveModel) : null;
+      const fallbackLabel = modelInfo.controlSource === 'connected-session'
+        ? 'Session Model'
+        : (matched && matched.displayName) || effectiveModel || configuredModel || defaultCfg || 'Codex Model';
+      return {
+        canSelect: Boolean(modelInfo.canSelect),
+        controlSource: modelInfo.controlSource || 'background-codex',
+        configuredModel,
+        effectiveModel,
+        defaultConfigModel: defaultCfg,
+        label: modelInfo.label || fallbackLabel,
+        reason: modelInfo.reason || '',
+        hint: modelInfo.hint || '',
+        availableModels: available
+      };
+    }
+    if (waitingAgentsCount > 0) {
+      return {
+        canSelect: false,
+        controlSource: 'connected-session',
+        configuredModel: selectedModel,
+        effectiveModel: null,
+        defaultConfigModel: '',
+        label: 'Session Model',
+        reason: 'Model selection is owned by your connected Codex CLI/Desktop session. MCP does not allow an external server to change the host Codex session model.',
+        hint: 'Switch models directly in Codex Desktop/CLI, or submit when no session is listening to pick a model for standalone background runs.',
+        availableModels: []
+      };
+    }
+    return {
+      canSelect: true,
+      controlSource: 'background-codex',
+      configuredModel: selectedModel,
+      effectiveModel: selectedModel,
+      defaultConfigModel: '',
+      label: selectedModel || 'Codex Model',
+      reason: 'Standalone background Codex will answer using your active Codex configuration. Click to switch models.',
+      hint: '',
+      availableModels: []
+    };
+  }
+
+  function closeModelPopover() {
+    modelPopoverOpen = false;
+    modelPopover.style.display = 'none';
+    const modelBtn = dock.querySelector('#cir-dock-model');
+    if (modelBtn && modelBtn.hasAttribute('aria-expanded')) {
+      modelBtn.setAttribute('aria-expanded', 'false');
+      const caret = modelBtn.querySelector('.cir-dock-caret');
+      if (caret) caret.textContent = '▾';
+    }
+  }
+
+  function renderModelPopover() {
+    if (!modelPopoverOpen) {
+      modelPopover.style.display = 'none';
+      return;
+    }
+    const view = getEffectiveModelView();
+    if (!view.canSelect) {
+      const hintHtml = view.hint
+        ? \`<p class="cir-sandbox-pop-hint">\${escapeHtml(view.hint)}</p>\`
+        : '';
+      modelPopover.innerHTML = \`
+        <div style="padding: 6px;">
+          <div class="cir-sandbox-pop-head">
+            <div class="cir-sandbox-pop-title">
+              <span>🔗 \${escapeHtml(view.label)}</span>
+              <span class="cir-sandbox-badge">Session-managed</span>
+            </div>
+            <button class="cir-pop-icon-btn" id="cir-model-pop-close" type="button" title="Close">✕</button>
+          </div>
+          <p class="cir-sandbox-pop-body">\${escapeHtml(view.reason)}</p>
+          \${hintHtml}
+        </div>
+      \`;
+    } else {
+      const activeSlug = view.effectiveModel || view.configuredModel || '';
+      const hasActiveInCatalog = !activeSlug || view.availableModels.some((m) => m.slug === activeSlug);
+      const customActiveHtml = !hasActiveInCatalog
+        ? \`
+          <button class="cir-model-item active" data-model-slug="\${escapeHtml(activeSlug)}" role="option" aria-selected="true" type="button">
+            <div class="cir-model-item-top">
+              <span class="cir-model-item-name">\${escapeHtml(activeSlug)}</span>
+              <span>✓</span>
+            </div>
+            <span class="cir-model-item-desc">Active Codex model</span>
+          </button>
+        \`
+        : '';
+
+      const catalogHtml = view.availableModels.map((m) => {
+        const isCurrent = activeSlug === m.slug;
+        const showSlug = m.displayName && m.displayName.toLowerCase() !== m.slug.toLowerCase();
+        return \`
+          <button class="cir-model-item \${isCurrent ? 'active' : ''}" data-model-slug="\${escapeHtml(m.slug)}" role="option" aria-selected="\${isCurrent ? 'true' : 'false'}" type="button" title="\${escapeHtml(m.description || m.slug)}">
+            <div class="cir-model-item-top">
+              <span class="cir-model-item-name">\${escapeHtml(m.displayName || m.slug)}</span>
+              <span style="display:flex; align-items:center; gap:6px;">
+                \${showSlug ? \`<span class="cir-model-item-slug">\${escapeHtml(m.slug)}</span>\` : ''}
+                \${isCurrent ? '<span>✓</span>' : ''}
+              </span>
+            </div>
+            \${m.description ? \`<span class="cir-model-item-desc">\${escapeHtml(m.description)}</span>\` : ''}
+          </button>
+        \`;
+      }).join('');
+
+      const fallbackCustomRowHtml = view.availableModels.length === 0
+        ? \`
+          <div class="cir-model-custom-row">
+            <input class="cir-model-input" id="cir-model-custom-input" type="text" placeholder="Enter model slug (e.g. gpt-6.1-sol)" value="\${escapeHtml(activeSlug)}" />
+            <button class="cir-pop-btn-primary" id="cir-model-custom-apply" type="button">Use</button>
+          </div>
+        \`
+        : '';
+
+      modelPopover.innerHTML = \`
+        <div class="cir-model-header">
+          <div class="cir-sandbox-pop-title">
+            <span>🧠 Background Run Model</span>
+          </div>
+          <button class="cir-pop-icon-btn" id="cir-model-pop-close" type="button" title="Close">✕</button>
+        </div>
+        <div class="cir-model-list" role="listbox" aria-label="Select background Codex model">
+          \${customActiveHtml}
+          \${catalogHtml}
+        </div>
+        \${fallbackCustomRowHtml}
+      \`;
+    }
+
+    modelPopover.style.display = 'block';
+    const modelBtn = dock.querySelector('#cir-dock-model');
+    const btnRect = modelBtn ? modelBtn.getBoundingClientRect() : dock.getBoundingClientRect();
+    const popRect = modelPopover.getBoundingClientRect();
+    const popW = popRect.width || 320;
+    const popH = popRect.height || 220;
+    const left = Math.min(window.innerWidth - popW - 16, Math.max(16, btnRect.left));
+    const top = Math.max(16, btnRect.top - popH - 12);
+    modelPopover.style.left = left + 'px';
+    modelPopover.style.top = top + 'px';
+
+    const closeBtn = modelPopover.querySelector('#cir-model-pop-close');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeModelPopover();
+      });
+    }
+    if (view.canSelect) {
+      modelPopover.querySelectorAll('.cir-model-item').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const slug = btn.getAttribute('data-model-slug') || '';
+          applyModelSelection(slug || null);
+        });
+      });
+      const customInput = modelPopover.querySelector('#cir-model-custom-input');
+      const customApply = modelPopover.querySelector('#cir-model-custom-apply');
+      const applyCustom = () => {
+        const val = customInput ? customInput.value.trim() : '';
+        applyModelSelection(val || null);
+      };
+      if (customApply) {
+        customApply.addEventListener('click', (e) => {
+          e.stopPropagation();
+          applyCustom();
+        });
+      }
+      if (customInput) {
+        customInput.addEventListener('click', (e) => e.stopPropagation());
+        customInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            applyCustom();
+          } else if (e.key === 'Escape') {
+            closeModelPopover();
+          }
+        });
+      }
+    }
+  }
+
+  async function applyModelSelection(nextModel) {
+    closeModelPopover();
+    const res = await apiCall('POST', '/model', { file: FILE_PATH, model: nextModel });
+    if (res && res.model) {
+      modelInfo = res.model;
+      selectedModel = res.model.configuredModel ?? null;
+    }
+    if (res && res.applied === false) {
+      renderDock();
+      modelPopoverOpen = true;
+      renderModelPopover();
+      showToast('ℹ️ ' + (res.error || 'Model selection is locked while a Codex session is listening'), 4500);
+      return;
+    }
+    renderDock();
+    const label = modelInfo && modelInfo.label ? modelInfo.label : (selectedModel || 'Codex Model');
+    const suffix = codexRun ? ' (applies to next submission)' : '';
+    showToast('🧠 Background Codex model: ' + label + suffix);
+  }
+
   document.addEventListener('click', (e) => {
-    if (!sandboxPopoverOpen) return;
+    if (!sandboxPopoverOpen && !modelPopoverOpen) return;
     const el = e.target;
     if (el && el.closest && el.closest('#codex-inline-review-root')) return;
     closeSandboxPopover();
+    closeModelPopover();
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && sandboxPopoverOpen) {
-      closeSandboxPopover();
+    if (e.key === 'Escape') {
+      if (sandboxPopoverOpen) closeSandboxPopover();
+      if (modelPopoverOpen) closeModelPopover();
     }
   });
 
@@ -1711,11 +2043,12 @@ export function getWidgetScript(filePath: string): string {
     const openCount = state.threads.filter(t => t.status === 'open').length;
     dock.classList.toggle('sidebar-open', sidebarOpen);
 
+    const runningStatusText = codexRun ? (codexRun.statusText || 'Codex working...') : '';
     const agentIndicator = codexRun
-      ? \`<div class="cir-agent-status" title="Codex is actively processing your inline comments"><span class="cir-dot waiting" style="background:#818cf8; box-shadow:0 0 8px #818cf8;"></span>🤖 Codex working...</div>\`
+      ? \`<div class="cir-agent-status" id="cir-agent-status-pill" title="Codex is actively processing your inline comments"><span class="cir-dot waiting" style="background:#818cf8; box-shadow:0 0 8px #818cf8;"></span>🤖 <span id="cir-agent-status-text">\${escapeHtml(runningStatusText)}</span></div>\`
       : waitingAgentsCount > 0
-        ? \`<div class="cir-agent-status" title="Codex is actively waiting for your submission"><span class="cir-dot waiting"></span>Codex listening</div>\`
-        : \`<div class="cir-agent-status" title="Clicking Submit will automatically invoke Codex on your comments"><span class="cir-dot"></span>Ready</div>\`;
+        ? \`<div class="cir-agent-status" id="cir-agent-status-pill" title="Codex is actively waiting for your submission"><span class="cir-dot waiting"></span><span id="cir-agent-status-text">Codex listening</span></div>\`
+        : \`<div class="cir-agent-status" id="cir-agent-status-pill" title="Clicking Submit will automatically invoke Codex on your comments"><span class="cir-dot"></span><span id="cir-agent-status-text">Ready</span></div>\`;
 
     const view = getEffectiveSandboxView();
     let sandboxClass = '';
@@ -1735,10 +2068,41 @@ export function getWidgetScript(filePath: string): string {
       sandboxIcon = '🔓';
     }
 
+    const mView = getEffectiveModelView();
+    let modelClass = '';
+    let modelAttrs = '';
+    let modelButtonHtml = '';
+    if (!mView.canSelect) {
+      modelClass = 'sandbox-locked';
+      modelAttrs = 'aria-disabled="true"';
+      modelButtonHtml = \`🔗 \${escapeHtml(mView.label)}\`;
+    } else {
+      const resolvedDefault = mView.defaultConfigModel || (mView.availableModels[0] ? mView.availableModels[0].slug : null);
+      if (mView.configuredModel && mView.configuredModel !== resolvedDefault) {
+        modelClass = 'sandbox-full';
+      }
+      modelAttrs = \`aria-haspopup="listbox" aria-expanded="\${modelPopoverOpen ? 'true' : 'false'}"\`;
+      modelButtonHtml = \`🧠 \${escapeHtml(mView.label)} <span class="cir-dock-caret">\${modelPopoverOpen ? '▴' : '▾'}</span>\`;
+    }
+
+    const submitLabel = isSubmitting
+      ? '⏳ Sending...'
+      : codexRun
+        ? (codexRun.queued ? '📥 Queued Next' : '⏳ Working (Queue Next)')
+        : '🚀 Submit to Codex';
+    const submitTitle = codexRun
+      ? (codexRun.queued
+          ? 'Follow-up batch is already queued for the next Codex run'
+          : 'Queue another batch of open comments while Codex finishes')
+      : 'Send all open comments to Codex';
+
     dock.innerHTML = \`
       \${agentIndicator}
       <button class="cir-dock-btn \${sandboxClass}" id="cir-dock-sandbox" data-sandbox-control="\${escapeHtml(view.controlSource)}" \${sandboxAriaDisabled} title="\${escapeHtml(view.reason)}">
         \${sandboxIcon} \${escapeHtml(view.label)}
+      </button>
+      <button class="cir-dock-btn \${modelClass}" id="cir-dock-model" data-model-control="\${escapeHtml(mView.controlSource)}" \${modelAttrs} title="\${escapeHtml(mView.reason)}">
+        \${modelButtonHtml}
       </button>
       <button class="cir-dock-btn \${pickMode ? 'active' : ''}" id="cir-dock-pick" title="Click any element on the page to pin a comment (or hold Option/Alt + Click)">
         🎯 \${pickMode ? 'Picking Element...' : 'Pick Element'}
@@ -1746,12 +2110,17 @@ export function getWidgetScript(filePath: string): string {
       <button class="cir-dock-btn" id="cir-dock-sidebar">
         💬 Threads <span class="cir-badge">\${openCount}</span>
       </button>
-      <button class="cir-dock-btn cir-dock-submit" id="cir-dock-submit" \${codexRun ? 'disabled' : ''} title="Send all open comments to Codex">
-        \${codexRun ? '⏳ Codex Responding...' : '🚀 Submit to Codex'}
+      <button class="cir-dock-btn cir-dock-submit" id="cir-dock-submit" \${isSubmitting ? 'disabled' : ''} title="\${escapeHtml(submitTitle)}">
+        \${submitLabel}
       </button>
     \`;
 
     dock.querySelector('#cir-dock-sandbox').addEventListener('click', toggleSandboxMode);
+    dock.querySelector('#cir-dock-model').addEventListener('click', () => {
+      closeSandboxPopover();
+      modelPopoverOpen = !modelPopoverOpen;
+      renderDock();
+    });
     dock.querySelector('#cir-dock-pick').addEventListener('click', () => setPickMode(!pickMode));
     dock.querySelector('#cir-dock-sidebar').addEventListener('click', () => {
       sidebarOpen = !sidebarOpen;
@@ -1765,6 +2134,11 @@ export function getWidgetScript(filePath: string): string {
       } else {
         renderSandboxPopover();
       }
+    }
+    if (modelPopoverOpen) {
+      renderModelPopover();
+    } else {
+      modelPopover.style.display = 'none';
     }
   }
 
@@ -1845,8 +2219,8 @@ export function getWidgetScript(filePath: string): string {
         \${threadsHtml}
       </div>
       <div class="cir-sidebar-footer">
-        <button class="cir-btn cir-btn-primary" id="cir-sidebar-submit" \${codexRun ? 'disabled' : ''} style="flex:1; justify-content:center; padding:7px 10px;">
-          \${codexRun ? '🤖 Answering...' : \`🚀 Submit to Codex (\${openCount})\`}
+        <button class="cir-btn cir-btn-primary" id="cir-sidebar-submit" \${isSubmitting ? 'disabled' : ''} style="flex:1; justify-content:center; padding:7px 10px;">
+          \${isSubmitting ? '⏳ Sending...' : codexRun ? (codexRun.queued ? '📥 Queued Next (' + openCount + ')' : '⏳ Working (Queue Next ' + openCount + ')') : '🚀 Submit to Codex (' + openCount + ')'}
         </button>
         <button class="cir-btn cir-btn-ghost" id="cir-sidebar-copy" title="Copy Markdown prompt to clipboard (for manual paste into chat)" style="padding:7px 9px; border:1px solid #e4e4e7;">
           📋
@@ -1909,10 +2283,12 @@ export function getWidgetScript(filePath: string): string {
   async function toggleSandboxMode() {
     const view = getEffectiveSandboxView();
     if (!view.canToggle) {
+      closeModelPopover();
       sandboxPopoverOpen = !sandboxPopoverOpen;
       renderSandboxPopover();
       return;
     }
+    closeModelPopover();
     closeSandboxPopover();
     const nextMode = sandboxMode === 'full-access' ? 'workspace-write' : 'full-access';
     const res = await apiCall('POST', '/sandbox', { file: FILE_PATH, sandboxMode: nextMode });
@@ -1939,20 +2315,65 @@ export function getWidgetScript(filePath: string): string {
   }
 
   async function submitReviewToCodex() {
-    const view = getEffectiveSandboxView();
-    const payload = view.canToggle ? { file: FILE_PATH, sandboxMode } : { file: FILE_PATH };
-    const res = await apiCall('POST', '/submit', payload);
-    await fetchState();
-    if (res && res.notifiedWaiters > 0) {
-      showToast('🚀 Submitted! Codex received your inline comments and is responding...');
-    } else if (res && res.spawnedCodex) {
-      showToast('🤖 Submitted! Codex is now working on your inline comments...', 5000);
-    } else if (res && res.prompt) {
-      try {
-        await navigator.clipboard.writeText(res.prompt);
-        showToast('🚀 Review saved & prompt copied! Tell Codex to address comments.');
-      } catch {
-        showToast('🚀 Review saved! Tell Codex to check inline comments.');
+    if (isSubmitting) return;
+    isSubmitting = true;
+    renderDock();
+    const sidebarSubmitBtn = sidebar.querySelector('#cir-sidebar-submit');
+    if (sidebarSubmitBtn) {
+      sidebarSubmitBtn.disabled = true;
+      sidebarSubmitBtn.textContent = '⏳ Sending...';
+    }
+
+    try {
+      const view = getEffectiveSandboxView();
+      const mView = getEffectiveModelView();
+      const payload = { file: FILE_PATH };
+      if (view.canToggle) payload.sandboxMode = sandboxMode;
+      if (mView.canSelect) payload.model = selectedModel;
+
+      const res = await apiCall('POST', '/submit', payload);
+      isSubmitting = false;
+
+      if (res && res.state) {
+        state = res.state;
+        if (res.sandbox) sandboxInfo = res.sandbox;
+        if (res.model) {
+          modelInfo = res.model;
+          selectedModel = res.model.configuredModel ?? null;
+        }
+        if (res.queued) {
+          codexRun = {
+            ...(codexRun || {}),
+            statusText: (codexRun && codexRun.statusText) || 'Codex working...',
+            queued: true
+          };
+        } else if (res.spawnedCodex) {
+          codexRun = { statusText: 'Starting Codex...' };
+        }
+        renderUI();
+      } else {
+        await fetchState();
+      }
+
+      if (res && res.notifiedWaiters > 0) {
+        showToast('🚀 Submitted! Codex received your inline comments and is responding...');
+      } else if (res && res.queued) {
+        showToast('📥 Added to queue — Codex will run next automatically.', 4500);
+      } else if (res && res.spawnedCodex) {
+        showToast('🤖 Submitted! Codex is now working on your inline comments...', 5000);
+      } else if (res && res.prompt) {
+        try {
+          await navigator.clipboard.writeText(res.prompt);
+          showToast('🚀 Review saved & prompt copied! Tell Codex to address comments.');
+        } catch {
+          showToast('🚀 Review saved! Tell Codex to check inline comments.');
+        }
+      }
+    } finally {
+      if (isSubmitting) {
+        isSubmitting = false;
+        renderDock();
+        if (sidebarOpen) renderSidebar();
       }
     }
   }
@@ -2002,6 +2423,10 @@ export function getWidgetScript(filePath: string): string {
       codexRun = data.codexRun || null;
       if (data.sandboxMode) sandboxMode = data.sandboxMode;
       if (data.sandbox) sandboxInfo = data.sandbox;
+      if (data.model) {
+        modelInfo = data.model;
+        selectedModel = data.model.configuredModel ?? null;
+      }
       renderUI();
     }
   }
@@ -2011,8 +2436,17 @@ export function getWidgetScript(filePath: string): string {
     const es = new EventSource(SSE_URL);
     es.addEventListener('comments-updated', async (e) => {
       const payload = JSON.parse(e.data || '{}');
+      if (payload.reason === 'model-changed' && payload.model) {
+        modelInfo = payload.model;
+        selectedModel = payload.model.configuredModel ?? null;
+        renderDock();
+        return;
+      }
       await fetchState();
-      if (payload.reason === 'codex-reply') {
+      if (payload.reason === 'codex-reply-batch') {
+        const count = payload.count || (Array.isArray(payload.commentIds) ? payload.commentIds.length : '');
+        showToast('🤖 Codex replied to ' + (count ? count + ' comment(s)' : 'your batch'));
+      } else if (payload.reason === 'codex-reply') {
         showToast('🤖 Codex replied to #' + (payload.number || payload.commentId || ''));
       } else if (payload.reason === 'codex-status') {
         showToast('✓ Codex updated #' + (payload.number || payload.commentId || ''));
@@ -2022,14 +2456,30 @@ export function getWidgetScript(filePath: string): string {
       const payload = JSON.parse(e.data || '{}');
       waitingAgentsCount = payload.waitingAgentsCount || 0;
       if (payload.sandbox) sandboxInfo = payload.sandbox;
+      if (payload.model) {
+        modelInfo = payload.model;
+        selectedModel = payload.model.configuredModel ?? null;
+      }
       renderDock();
     });
     es.addEventListener('agent-status', async (e) => {
       const payload = JSON.parse(e.data || '{}');
       if (payload.running) {
+        const wasRunning = Boolean(codexRun);
+        const wasQueued = Boolean(codexRun && codexRun.queued);
         codexRun = payload;
-        renderUI();
-        showToast('🤖 ' + (payload.statusText || 'Codex is working on your comments...'), 4500);
+        if (!wasRunning || wasQueued !== Boolean(payload.queued)) {
+          renderDock();
+          if (sidebarOpen) renderSidebar();
+          if (!wasRunning) {
+            showToast('🤖 ' + (payload.statusText || 'Codex is working on your comments...'), 3500);
+          }
+        } else {
+          const statusTextEl = dock.querySelector('#cir-agent-status-text');
+          if (statusTextEl) {
+            statusTextEl.textContent = payload.statusText || 'Codex working...';
+          }
+        }
       } else {
         codexRun = null;
         await fetchState();
@@ -2037,12 +2487,22 @@ export function getWidgetScript(filePath: string): string {
           showToast('⚠️ ' + payload.sandboxWarning, 7000);
         } else if (payload.error) {
           showToast('⚠️ ' + payload.error, 5000);
-        } else {
+        } else if (!codexRun) {
           showToast('✅ Codex finished responding to your comments!', 4000);
+        }
+        if (pendingHtmlReload && !codexRun) {
+          pendingHtmlReload = false;
+          showToast('✨ HTML updated by Codex — reloading preview...');
+          setTimeout(() => window.location.reload(), 250);
         }
       }
     });
     es.addEventListener('html-updated', () => {
+      if (codexRun) {
+        pendingHtmlReload = true;
+        showToast('✨ HTML updated — will reload preview when Codex finishes replying...', 2500);
+        return;
+      }
       showToast('✨ HTML updated by Codex — reloading preview...');
       setTimeout(() => window.location.reload(), 300);
     });
