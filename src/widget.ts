@@ -27,7 +27,9 @@ export function getWidgetScript(filePath: string): string {
   let hoveredEl = null;
   let waitingAgentsCount = 0;
   let codexRun = null;
-  let sandboxMode = 'workspace-write';
+  let sandboxMode = 'full-access';
+  let sandboxInfo = null;
+  let sandboxPopoverOpen = false;
   let sendToCodexImmediately = true;
   let popoverMode = null; // null | 'compose' | 'thread'
   let activeRecognition = null;
@@ -485,6 +487,76 @@ export function getWidgetScript(filePath: string): string {
       background: #4f46e5;
       color: #fff;
     }
+    .cir-dock-btn.sandbox-full {
+      color: #fbbf24;
+    }
+    .cir-dock-btn.sandbox-locked {
+      color: #a1a1aa;
+      background: rgba(255,255,255,0.06);
+    }
+    .cir-sandbox-popover {
+      position: fixed;
+      width: 340px;
+      max-width: calc(100vw - 32px);
+      background: #1e1e20;
+      color: #f4f4f5;
+      border-radius: 14px;
+      box-shadow: 0 16px 40px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.1);
+      padding: 14px;
+      pointer-events: auto;
+      z-index: 2147483647;
+      display: none;
+    }
+    .cir-sandbox-pop-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .cir-sandbox-pop-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #f4f4f5;
+    }
+    .cir-sandbox-badge {
+      font-size: 10.5px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.1);
+      color: #d4d4d8;
+    }
+    .cir-sandbox-pop-body {
+      font-size: 12.5px;
+      line-height: 1.45;
+      color: #d4d4d8;
+      margin: 0 0 8px 0;
+    }
+    .cir-sandbox-pop-hint {
+      font-size: 12px;
+      line-height: 1.4;
+      color: #a1a1aa;
+      margin: 0;
+    }
+    .cir-sandbox-cmd-wrap {
+      margin-top: 10px;
+      background: #111113;
+      border: 1px solid #3f3f46;
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
+    .cir-sandbox-cmd {
+      display: block;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      color: #e4e4e7;
+      word-break: break-all;
+      margin-bottom: 8px;
+    }
     .cir-dock-submit {
       background: linear-gradient(135deg, #4f46e5, #7c3aed);
       color: #fff;
@@ -743,6 +815,9 @@ export function getWidgetScript(filePath: string): string {
   const popover = document.createElement('div');
   popover.className = 'cir-popover';
 
+  const sandboxPopover = document.createElement('div');
+  sandboxPopover.className = 'cir-sandbox-popover';
+
   const dock = document.createElement('div');
   dock.className = 'cir-dock';
 
@@ -756,6 +831,7 @@ export function getWidgetScript(filePath: string): string {
   shadow.appendChild(hoverBox);
   shadow.appendChild(selectionPill);
   shadow.appendChild(popover);
+  shadow.appendChild(sandboxPopover);
   shadow.appendChild(dock);
   shadow.appendChild(sidebar);
   shadow.appendChild(toast);
@@ -1498,6 +1574,138 @@ export function getWidgetScript(filePath: string): string {
     }
   }
 
+  function getEffectiveSandboxView() {
+    if (sandboxInfo && typeof sandboxInfo === 'object') {
+      const effectiveMode = sandboxInfo.effectiveMode || sandboxMode;
+      const fallbackLabel = sandboxInfo.controlSource === 'connected-session'
+        ? 'Session Sandbox'
+        : sandboxInfo.controlSource === 'externally-sandboxed'
+          ? 'Host Sandboxed'
+          : sandboxInfo.controlSource === 'policy-restricted'
+            ? 'Policy Sandboxed'
+            : effectiveMode === 'full-access'
+              ? 'Full Access'
+              : 'Sandboxed';
+      return {
+        canToggle: Boolean(sandboxInfo.canToggle),
+        controlSource: sandboxInfo.controlSource || 'background-codex',
+        effectiveMode,
+        label: sandboxInfo.label || fallbackLabel,
+        reason: sandboxInfo.reason || '',
+        hint: sandboxInfo.hint || '',
+        restartCommand: sandboxInfo.restartCommand || ''
+      };
+    }
+    if (waitingAgentsCount > 0) {
+      return {
+        canToggle: false,
+        controlSource: 'connected-session',
+        effectiveMode: 'session-controlled',
+        label: 'Session Sandbox',
+        reason: 'Controlled by your connected Codex session. Submissions go directly to the listening Codex CLI/Desktop session and run under its own sandbox permissions.',
+        hint: 'To allow network or access outside the workspace, change permissions in your Codex session (e.g., Full Access in Codex Desktop or --sandbox danger-full-access in Codex CLI).',
+        restartCommand: ''
+      };
+    }
+    const isFull = sandboxMode === 'full-access';
+    return {
+      canToggle: true,
+      controlSource: 'background-codex',
+      effectiveMode: sandboxMode,
+      label: isFull ? 'Full Access' : 'Sandboxed',
+      reason: isFull
+        ? 'Standalone background Codex runs with Full Access (--dangerously-bypass-approvals-and-sandbox). Click to switch to Sandboxed.'
+        : 'Standalone background Codex runs in workspace-write sandbox (no network). Click to switch to Full Access.',
+      hint: '',
+      restartCommand: ''
+    };
+  }
+
+  function closeSandboxPopover() {
+    sandboxPopoverOpen = false;
+    sandboxPopover.style.display = 'none';
+  }
+
+  function renderSandboxPopover() {
+    const view = getEffectiveSandboxView();
+    if (!sandboxPopoverOpen || view.canToggle) {
+      sandboxPopover.style.display = 'none';
+      return;
+    }
+    const statusIcon = view.controlSource === 'connected-session' ? '🔗' : '🔒';
+    const badgeText = view.controlSource === 'connected-session'
+      ? 'Session-managed'
+      : view.controlSource === 'externally-sandboxed'
+        ? 'Host-locked'
+        : 'Policy-locked';
+    const hintHtml = view.hint
+      ? \`<p class="cir-sandbox-pop-hint">\${escapeHtml(view.hint)}</p>\`
+      : '';
+    const cmdHtml = view.restartCommand
+      ? \`<div class="cir-sandbox-cmd-wrap">
+          <code class="cir-sandbox-cmd">\${escapeHtml(view.restartCommand)}</code>
+          <button class="cir-pop-btn-primary" id="cir-sandbox-copy-cmd" type="button">📋 Copy restart command</button>
+        </div>\`
+      : '';
+
+    sandboxPopover.innerHTML = \`
+      <div class="cir-sandbox-pop-head">
+        <div class="cir-sandbox-pop-title">
+          <span>\${statusIcon} \${escapeHtml(view.label)}</span>
+          <span class="cir-sandbox-badge">\${badgeText}</span>
+        </div>
+        <button class="cir-pop-icon-btn" id="cir-sandbox-pop-close" type="button" title="Close">✕</button>
+      </div>
+      <p class="cir-sandbox-pop-body">\${escapeHtml(view.reason)}</p>
+      \${hintHtml}
+      \${cmdHtml}
+    \`;
+
+    sandboxPopover.style.display = 'block';
+    const sandboxBtn = dock.querySelector('#cir-dock-sandbox');
+    const btnRect = sandboxBtn ? sandboxBtn.getBoundingClientRect() : dock.getBoundingClientRect();
+    const popRect = sandboxPopover.getBoundingClientRect();
+    const popW = popRect.width || 340;
+    const popH = popRect.height || 180;
+    const left = Math.min(window.innerWidth - popW - 16, Math.max(16, btnRect.left));
+    const top = Math.max(16, btnRect.top - popH - 12);
+    sandboxPopover.style.left = left + 'px';
+    sandboxPopover.style.top = top + 'px';
+
+    const closeBtn = sandboxPopover.querySelector('#cir-sandbox-pop-close');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeSandboxPopover();
+      });
+    }
+    const copyCmdBtn = sandboxPopover.querySelector('#cir-sandbox-copy-cmd');
+    if (copyCmdBtn && view.restartCommand) {
+      copyCmdBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        try {
+          await navigator.clipboard.writeText(view.restartCommand);
+          showToast('📋 Copied restart command to clipboard!');
+        } catch {
+          showToast('⚠️ Could not copy command to clipboard');
+        }
+      });
+    }
+  }
+
+  document.addEventListener('click', (e) => {
+    if (!sandboxPopoverOpen) return;
+    const el = e.target;
+    if (el && el.closest && el.closest('#codex-inline-review-root')) return;
+    closeSandboxPopover();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && sandboxPopoverOpen) {
+      closeSandboxPopover();
+    }
+  });
+
   // --- Render Dock & Sidebar ---
   function renderDock() {
     const openCount = state.threads.filter(t => t.status === 'open').length;
@@ -1509,15 +1717,28 @@ export function getWidgetScript(filePath: string): string {
         ? \`<div class="cir-agent-status" title="Codex is actively waiting for your submission"><span class="cir-dot waiting"></span>Codex listening</div>\`
         : \`<div class="cir-agent-status" title="Clicking Submit will automatically invoke Codex on your comments"><span class="cir-dot"></span>Ready</div>\`;
 
-    const isFullAccess = sandboxMode === 'full-access';
-    const sandboxTitle = isFullAccess
-      ? 'Codex runs with Full Access (can fetch web assets & access system files). Click to switch back to Sandboxed.'
-      : 'Codex runs in workspace-write sandbox (can only edit files in this folder, no network). Click to grant Full Access.';
+    const view = getEffectiveSandboxView();
+    let sandboxClass = '';
+    let sandboxIcon = '🔒';
+    let sandboxAriaDisabled = '';
+
+    if (view.controlSource === 'connected-session') {
+      sandboxClass = 'sandbox-locked';
+      sandboxIcon = '🔗';
+      sandboxAriaDisabled = 'aria-disabled="true"';
+    } else if (view.controlSource === 'externally-sandboxed' || view.controlSource === 'policy-restricted') {
+      sandboxClass = 'sandbox-locked';
+      sandboxIcon = '🔒';
+      sandboxAriaDisabled = 'aria-disabled="true"';
+    } else if (view.effectiveMode === 'full-access') {
+      sandboxClass = 'sandbox-full';
+      sandboxIcon = '🔓';
+    }
 
     dock.innerHTML = \`
       \${agentIndicator}
-      <button class="cir-dock-btn" id="cir-dock-sandbox" style="\${isFullAccess ? 'color:#fbbf24;' : ''}" title="\${sandboxTitle}">
-        \${isFullAccess ? '🔓 Full Access' : '🔒 Sandboxed'}
+      <button class="cir-dock-btn \${sandboxClass}" id="cir-dock-sandbox" data-sandbox-control="\${escapeHtml(view.controlSource)}" \${sandboxAriaDisabled} title="\${escapeHtml(view.reason)}">
+        \${sandboxIcon} \${escapeHtml(view.label)}
       </button>
       <button class="cir-dock-btn \${pickMode ? 'active' : ''}" id="cir-dock-pick" title="Click any element on the page to pin a comment (or hold Option/Alt + Click)">
         🎯 \${pickMode ? 'Picking Element...' : 'Pick Element'}
@@ -1537,6 +1758,14 @@ export function getWidgetScript(filePath: string): string {
       renderUI();
     });
     dock.querySelector('#cir-dock-submit').addEventListener('click', submitReviewToCodex);
+
+    if (sandboxPopoverOpen) {
+      if (view.canToggle) {
+        closeSandboxPopover();
+      } else {
+        renderSandboxPopover();
+      }
+    }
   }
 
   function renderSidebar() {
@@ -1678,21 +1907,41 @@ export function getWidgetScript(filePath: string): string {
   }
 
   async function toggleSandboxMode() {
+    const view = getEffectiveSandboxView();
+    if (!view.canToggle) {
+      sandboxPopoverOpen = !sandboxPopoverOpen;
+      renderSandboxPopover();
+      return;
+    }
+    closeSandboxPopover();
     const nextMode = sandboxMode === 'full-access' ? 'workspace-write' : 'full-access';
     const res = await apiCall('POST', '/sandbox', { file: FILE_PATH, sandboxMode: nextMode });
+    if (res && res.sandbox) {
+      sandboxInfo = res.sandbox;
+    }
+    if (res && res.applied === false) {
+      renderDock();
+      sandboxPopoverOpen = true;
+      renderSandboxPopover();
+      showToast('ℹ️ ' + (res.error || view.reason), 4500);
+      return;
+    }
     if (res && res.sandboxMode) {
       sandboxMode = res.sandboxMode;
       renderDock();
+      const suffix = codexRun ? ' (applies to next submission)' : '';
       showToast(
-        sandboxMode === 'full-access'
+        (sandboxMode === 'full-access'
           ? '🔓 Switched to Full Access mode'
-          : '🔒 Switched to Sandboxed mode (workspace-write)'
+          : '🔒 Switched to Sandboxed mode (workspace-write)') + suffix
       );
     }
   }
 
   async function submitReviewToCodex() {
-    const res = await apiCall('POST', '/submit', { file: FILE_PATH, sandboxMode });
+    const view = getEffectiveSandboxView();
+    const payload = view.canToggle ? { file: FILE_PATH, sandboxMode } : { file: FILE_PATH };
+    const res = await apiCall('POST', '/submit', payload);
     await fetchState();
     if (res && res.notifiedWaiters > 0) {
       showToast('🚀 Submitted! Codex received your inline comments and is responding...');
@@ -1752,6 +2001,7 @@ export function getWidgetScript(filePath: string): string {
       waitingAgentsCount = data.waitingAgentsCount || 0;
       codexRun = data.codexRun || null;
       if (data.sandboxMode) sandboxMode = data.sandboxMode;
+      if (data.sandbox) sandboxInfo = data.sandbox;
       renderUI();
     }
   }
@@ -1771,6 +2021,7 @@ export function getWidgetScript(filePath: string): string {
     es.addEventListener('waiters-updated', (e) => {
       const payload = JSON.parse(e.data || '{}');
       waitingAgentsCount = payload.waitingAgentsCount || 0;
+      if (payload.sandbox) sandboxInfo = payload.sandbox;
       renderDock();
     });
     es.addEventListener('agent-status', async (e) => {
@@ -1782,7 +2033,9 @@ export function getWidgetScript(filePath: string): string {
       } else {
         codexRun = null;
         await fetchState();
-        if (payload.error) {
+        if (payload.sandboxWarning) {
+          showToast('⚠️ ' + payload.sandboxWarning, 7000);
+        } else if (payload.error) {
           showToast('⚠️ ' + payload.error, 5000);
         } else {
           showToast('✅ Codex finished responding to your comments!', 4000);

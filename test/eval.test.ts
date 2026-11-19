@@ -20,7 +20,13 @@ import {
   updateThreadStatus,
   waitForFileSubmission,
 } from '../src/store.ts';
-import { InlineReviewServer, injectReviewWidget } from '../src/server.ts';
+import {
+  InlineReviewServer,
+  buildBackgroundCodexInvocation,
+  detectSandboxErrorMessage,
+  injectReviewWidget,
+  resolveWorkspaceRoot,
+} from '../src/server.ts';
 import { getWidgetScript } from '../src/widget.ts';
 
 const execFileAsync = promisify(execFile);
@@ -417,12 +423,16 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
     assert.match(script, /function openThreadPopover\(/);
     assert.match(script, /\.cir-popover/);
 
-    // [✓] Send to Codex toggles in composer & thread reply popover + sandbox toggle in dock
+    // [✓] Send to Codex toggles in composer & thread reply popover + context-aware sandbox control
     assert.match(script, /id="cir-send-now"/);
     assert.match(script, /id="cir-pop-send-now"/);
     assert.match(script, /Send to Codex/);
     assert.match(script, /id="cir-dock-sandbox"/);
     assert.match(script, /toggleSandboxMode/);
+    assert.match(script, /cir-sandbox-popover/);
+    assert.match(script, /Session Sandbox/);
+    assert.match(script, /Host Sandboxed/);
+    assert.match(script, /sandboxInfo/);
 
     // Voice dictation
     assert.match(script, /function attachVoiceDictation\(/);
@@ -441,7 +451,10 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
   it('enforces origin checks, path traversal rejection, and >2MB body size limits on InlineReviewServer', async () => {
     const dir = makeTempDir();
     const htmlFile = makeTempHtml(dir);
-    const server = new InlineReviewServer(4321, htmlFile);
+    const server = new InlineReviewServer(4321, htmlFile, undefined, {
+      env: {},
+      requirementsPath: path.join(dir, 'no-requirements.toml'),
+    });
 
     try {
       // 1. External Origin rejected with 403 on /__inline_review__/api/... and /__inline_review__/events
@@ -461,26 +474,33 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
       assert.equal(evilSseRes.statusCode, 403);
       assert.deepEqual(JSON.parse(evilSseRes.body), { error: 'Forbidden origin' });
 
-      // Allowed localhost origin succeeds & defaults to workspace-write sandbox
+      // Allowed localhost origin succeeds & standalone unsandboxed server defaults to full-access
       const localApiReq = new MockRequest('GET', '/__inline_review__/api/health', {
         host: '127.0.0.1:4321',
         origin: 'http://localhost:4321',
       });
       const localApiRes = await dispatchHandleRequest(server, localApiReq);
       assert.equal(localApiRes.statusCode, 200);
-      assert.equal(JSON.parse(localApiRes.body).ok, true);
-      assert.equal(JSON.parse(localApiRes.body).sandboxMode, 'workspace-write');
+      const localHealth = JSON.parse(localApiRes.body);
+      assert.equal(localHealth.ok, true);
+      assert.equal(localHealth.sandboxMode, 'full-access');
+      assert.equal(localHealth.sandbox.controlSource, 'background-codex');
+      assert.equal(localHealth.sandbox.canToggle, true);
 
-      // Live sandbox toggle endpoint switches between workspace-write and full-access
-      const toggleFullReq = new MockRequest(
+      // Live sandbox toggle endpoint switches between full-access and workspace-write
+      const toggleRestrictedReq = new MockRequest(
         'POST',
         '/__inline_review__/api/sandbox',
         { host: '127.0.0.1:4321', 'content-type': 'application/json' },
-        JSON.stringify({ file: htmlFile, sandboxMode: 'full-access' })
+        JSON.stringify({ file: htmlFile, sandboxMode: 'workspace-write' })
       );
-      const toggleFullRes = await dispatchHandleRequest(server, toggleFullReq);
-      assert.equal(toggleFullRes.statusCode, 200);
-      assert.equal(JSON.parse(toggleFullRes.body).sandboxMode, 'full-access');
+      const toggleRestrictedRes = await dispatchHandleRequest(server, toggleRestrictedReq);
+      assert.equal(toggleRestrictedRes.statusCode, 200);
+      const restrictedBody = JSON.parse(toggleRestrictedRes.body);
+      assert.equal(restrictedBody.ok, true);
+      assert.equal(restrictedBody.applied, true);
+      assert.equal(restrictedBody.sandboxMode, 'workspace-write');
+      assert.equal(restrictedBody.sandbox.effectiveMode, 'workspace-write');
 
       const stateAfterToggleReq = new MockRequest(
         'GET',
@@ -489,17 +509,22 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
       );
       const stateAfterToggleRes = await dispatchHandleRequest(server, stateAfterToggleReq);
       assert.equal(stateAfterToggleRes.statusCode, 200);
-      assert.equal(JSON.parse(stateAfterToggleRes.body).sandboxMode, 'full-access');
+      assert.equal(JSON.parse(stateAfterToggleRes.body).sandboxMode, 'workspace-write');
+      assert.equal(JSON.parse(stateAfterToggleRes.body).sandbox.effectiveMode, 'workspace-write');
 
       const toggleBackReq = new MockRequest(
         'POST',
         '/__inline_review__/api/sandbox',
         { host: '127.0.0.1:4321', 'content-type': 'application/json' },
-        JSON.stringify({ file: htmlFile, sandboxMode: 'workspace-write' })
+        JSON.stringify({ file: htmlFile, sandboxMode: 'full-access' })
       );
       const toggleBackRes = await dispatchHandleRequest(server, toggleBackReq);
       assert.equal(toggleBackRes.statusCode, 200);
-      assert.equal(JSON.parse(toggleBackRes.body).sandboxMode, 'workspace-write');
+      const backBody = JSON.parse(toggleBackRes.body);
+      assert.equal(backBody.ok, true);
+      assert.equal(backBody.applied, true);
+      assert.equal(backBody.sandboxMode, 'full-access');
+      assert.equal(backBody.sandbox.effectiveMode, 'full-access');
 
       // 2. Path traversal attempts rejected (403 on encoded traversal escaping baseDir; raw dot-segments collapsed & blocked)
       const encodedTraversalReq = new MockRequest('GET', '/..%2f..%2fetc/passwd', {
@@ -588,6 +613,299 @@ describe('Suite 2 — Widget Injection, Security Hardening & Browser Script Eval
     } finally {
       await server.stop();
     }
+  });
+
+  it('locks sandbox toggle while a connected Codex session is waiting and recovers afterward', async () => {
+    const dir = makeTempDir();
+    const htmlFile = makeTempHtml(dir);
+    const server = new InlineReviewServer(4321, htmlFile, undefined, {
+      env: {},
+      requirementsPath: path.join(dir, 'no-requirements.toml'),
+    });
+
+    try {
+      const waitPromise = server.waitForSubmission(htmlFile, 5_000);
+
+      const waitingStateReq = new MockRequest(
+        'GET',
+        `/__inline_review__/api/state?file=${encodeURIComponent(htmlFile)}`,
+        { host: '127.0.0.1:4321' }
+      );
+      const waitingStateRes = await dispatchHandleRequest(server, waitingStateReq);
+      const waitingState = JSON.parse(waitingStateRes.body);
+      assert.equal(waitingState.waitingAgentsCount, 1);
+      assert.equal(waitingState.sandbox.controlSource, 'connected-session');
+      assert.equal(waitingState.sandbox.effectiveMode, 'session-controlled');
+      assert.equal(waitingState.sandbox.canToggle, false);
+      assert.equal(waitingState.sandbox.label, 'Session Sandbox');
+
+      // Attempted toggle while session is listening must be refused honestly
+      const blockedToggleReq = new MockRequest(
+        'POST',
+        '/__inline_review__/api/sandbox',
+        { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+        JSON.stringify({ file: htmlFile, sandboxMode: 'workspace-write' })
+      );
+      const blockedToggleRes = await dispatchHandleRequest(server, blockedToggleReq);
+      const blockedBody = JSON.parse(blockedToggleRes.body);
+      assert.equal(blockedBody.ok, false);
+      assert.equal(blockedBody.applied, false);
+      assert.equal(blockedBody.sandbox.controlSource, 'connected-session');
+
+      // Submitting resolves the connected session and restores standalone toggle control
+      const submitReq = new MockRequest(
+        'POST',
+        '/__inline_review__/api/submit',
+        { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+        JSON.stringify({ file: htmlFile, autoRunCodex: false })
+      );
+      const submitRes = await dispatchHandleRequest(server, submitReq);
+      const submitBody = JSON.parse(submitRes.body);
+      assert.equal(submitBody.notifiedWaiters, 1);
+      assert.equal(submitBody.sandbox.controlSource, 'background-codex');
+      assert.equal(submitBody.sandbox.canToggle, true);
+
+      await waitPromise;
+
+      // Aborting a waiter via AbortController also restores standalone toggle control
+      const abortController = new AbortController();
+      const abortedWait = server.waitForSubmission(htmlFile, 5_000, abortController.signal);
+      abortController.abort();
+      await abortedWait;
+
+      const recoveredStateReq = new MockRequest(
+        'GET',
+        `/__inline_review__/api/state?file=${encodeURIComponent(htmlFile)}`,
+        { host: '127.0.0.1:4321' }
+      );
+      const recoveredStateRes = await dispatchHandleRequest(server, recoveredStateReq);
+      const recoveredState = JSON.parse(recoveredStateRes.body);
+      assert.equal(recoveredState.waitingAgentsCount, 0);
+      assert.equal(recoveredState.sandbox.controlSource, 'background-codex');
+      assert.equal(recoveredState.sandbox.canToggle, true);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('cleans up waiter state when a POST /__inline_review__/api/wait client disconnects early', async () => {
+    const dir = makeTempDir();
+    const htmlFile = makeTempHtml(dir);
+    const server = new InlineReviewServer(4321, htmlFile, undefined, {
+      env: {},
+      requirementsPath: path.join(dir, 'no-requirements.toml'),
+    });
+
+    try {
+      const waitReq = new MockRequest(
+        'POST',
+        '/__inline_review__/api/wait',
+        { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+        JSON.stringify({ file: htmlFile, timeoutMs: 5_000 })
+      );
+      const waitRes = new MockResponse();
+      const handlePromise = (
+        server as unknown as {
+          handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void>;
+        }
+      ).handleRequest(waitReq as unknown as IncomingMessage, waitRes as unknown as ServerResponse);
+
+      // Let readJsonBody finish and waitForSubmission register
+      await new Promise((r) => setTimeout(r, 30));
+
+      const activeStateReq = new MockRequest(
+        'GET',
+        `/__inline_review__/api/state?file=${encodeURIComponent(htmlFile)}`,
+        { host: '127.0.0.1:4321' }
+      );
+      const activeStateRes = await dispatchHandleRequest(server, activeStateReq);
+      assert.equal(JSON.parse(activeStateRes.body).waitingAgentsCount, 1);
+
+      // Simulate client closing connection before response ends
+      waitRes.emit('close');
+      await handlePromise;
+
+      const afterCloseReq = new MockRequest(
+        'GET',
+        `/__inline_review__/api/state?file=${encodeURIComponent(htmlFile)}`,
+        { host: '127.0.0.1:4321' }
+      );
+      const afterCloseRes = await dispatchHandleRequest(server, afterCloseReq);
+      const afterCloseState = JSON.parse(afterCloseRes.body);
+      assert.equal(afterCloseState.waitingAgentsCount, 0);
+      assert.equal(afterCloseState.sandbox.controlSource, 'background-codex');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it('detects outer OS sandbox signals and locks Full Access toggling', async () => {
+    const dir = makeTempDir();
+    const htmlFile = makeTempHtml(dir);
+    const noReq = path.join(dir, 'no-requirements.toml');
+
+    const seatbeltServer = new InlineReviewServer(4321, htmlFile, undefined, {
+      env: { CODEX_SANDBOX: 'seatbelt' },
+      requirementsPath: noReq,
+    });
+    try {
+      const stateReq = new MockRequest(
+        'GET',
+        `/__inline_review__/api/state?file=${encodeURIComponent(htmlFile)}`,
+        { host: '127.0.0.1:4321' }
+      );
+      const stateRes = await dispatchHandleRequest(seatbeltServer, stateReq);
+      const stateBody = JSON.parse(stateRes.body);
+      assert.equal(stateBody.sandboxMode, 'workspace-write');
+      assert.equal(stateBody.sandbox.controlSource, 'externally-sandboxed');
+      assert.equal(stateBody.sandbox.canToggle, false);
+      assert.equal(stateBody.sandbox.label, 'Host Sandboxed');
+      assert.equal(stateBody.sandbox.externalSandboxSignal, 'CODEX_SANDBOX=seatbelt');
+      assert.ok(stateBody.sandbox.restartCommand);
+
+      const toggleReq = new MockRequest(
+        'POST',
+        '/__inline_review__/api/sandbox',
+        { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+        JSON.stringify({ file: htmlFile, sandboxMode: 'full-access' })
+      );
+      const toggleRes = await dispatchHandleRequest(seatbeltServer, toggleReq);
+      const toggleBody = JSON.parse(toggleRes.body);
+      assert.equal(toggleBody.ok, false);
+      assert.equal(toggleBody.applied, false);
+      assert.equal(toggleBody.sandbox.controlSource, 'externally-sandboxed');
+    } finally {
+      await seatbeltServer.stop();
+    }
+
+    const netDisabledServer = new InlineReviewServer(4321, htmlFile, undefined, {
+      env: { CODEX_SANDBOX_NETWORK_DISABLED: '1' },
+      requirementsPath: noReq,
+    });
+    try {
+      const caps = netDisabledServer.getSandboxCapabilities(htmlFile);
+      assert.equal(caps.controlSource, 'externally-sandboxed');
+      assert.equal(caps.canToggle, false);
+      assert.equal(caps.externalSandboxSignal, 'CODEX_SANDBOX_NETWORK_DISABLED=1');
+    } finally {
+      await netDisabledServer.stop();
+    }
+  });
+
+  it('enforces system requirements.toml allowed_sandbox_modes policy', async () => {
+    const dir = makeTempDir();
+    const htmlFile = makeTempHtml(dir);
+    const restrictedReqPath = path.join(dir, 'restricted-requirements.toml');
+    fs.writeFileSync(
+      restrictedReqPath,
+      '# Managed policy\nallowed_sandbox_modes = ["read-only", "workspace-write"]\n',
+      'utf8'
+    );
+
+    const restrictedServer = new InlineReviewServer(4321, htmlFile, undefined, {
+      env: {},
+      requirementsPath: restrictedReqPath,
+    });
+    try {
+      const caps = restrictedServer.getSandboxCapabilities(htmlFile);
+      assert.equal(caps.configuredMode, 'workspace-write');
+      assert.equal(caps.controlSource, 'policy-restricted');
+      assert.equal(caps.canToggle, false);
+      assert.equal(caps.label, 'Policy Sandboxed');
+
+      const toggleReq = new MockRequest(
+        'POST',
+        '/__inline_review__/api/sandbox',
+        { host: '127.0.0.1:4321', 'content-type': 'application/json' },
+        JSON.stringify({ file: htmlFile, sandboxMode: 'full-access' })
+      );
+      const toggleRes = await dispatchHandleRequest(restrictedServer, toggleReq);
+      const toggleBody = JSON.parse(toggleRes.body);
+      assert.equal(toggleBody.ok, false);
+      assert.equal(toggleBody.applied, false);
+      assert.equal(toggleBody.sandbox.controlSource, 'policy-restricted');
+    } finally {
+      await restrictedServer.stop();
+    }
+
+    const permissiveReqPath = path.join(dir, 'permissive-requirements.toml');
+    fs.writeFileSync(
+      permissiveReqPath,
+      'allowed_sandbox_modes = ["workspace-write", "danger-full-access"]\n',
+      'utf8'
+    );
+    const permissiveServer = new InlineReviewServer(4321, htmlFile, undefined, {
+      env: {},
+      requirementsPath: permissiveReqPath,
+    });
+    try {
+      const caps = permissiveServer.getSandboxCapabilities(htmlFile);
+      assert.equal(caps.configuredMode, 'full-access');
+      assert.equal(caps.controlSource, 'background-codex');
+      assert.equal(caps.canToggle, true);
+    } finally {
+      await permissiveServer.stop();
+    }
+  });
+
+  it('resolves workspace root, builds mode-aware Codex invocations, and diagnoses sandbox errors', () => {
+    const repoDemo = path.join(REPO_ROOT, 'examples', 'demo.html');
+    assert.equal(resolveWorkspaceRoot(repoDemo), REPO_ROOT);
+
+    const isolatedDir = makeTempDir('non-git-html-');
+    const isolatedHtml = makeTempHtml(isolatedDir);
+    assert.equal(resolveWorkspaceRoot(isolatedHtml), path.resolve(isolatedDir));
+
+    const fullInvocation = buildBackgroundCodexInvocation({
+      filePath: repoDemo,
+      reviewReport: '# Review',
+      sandboxMode: 'full-access',
+      nodeBin: process.execPath,
+      cliPath: CLI_ENTRY,
+      tmpOutFile: '/tmp/out.txt',
+    });
+    assert.equal(fullInvocation.workDir, REPO_ROOT);
+    assert.ok(fullInvocation.args.includes('--dangerously-bypass-approvals-and-sandbox'));
+    assert.ok(fullInvocation.args.includes('web_search="live"'));
+    assert.ok(fullInvocation.args.includes('-C'));
+    assert.ok(fullInvocation.args.includes(REPO_ROOT));
+    assert.equal(fullInvocation.agentPrompt.includes('Read ONLY'), false);
+    assert.equal(fullInvocation.agentPrompt.includes('Scope strictly to'), false);
+    assert.match(fullInvocation.agentPrompt, /Full Access mode/);
+
+    const wsInvocation = buildBackgroundCodexInvocation({
+      filePath: repoDemo,
+      reviewReport: '# Review',
+      sandboxMode: 'workspace-write',
+      nodeBin: process.execPath,
+      cliPath: CLI_ENTRY,
+      tmpOutFile: '/tmp/out.txt',
+    });
+    assert.equal(wsInvocation.workDir, REPO_ROOT);
+    const sandboxIdx = wsInvocation.args.indexOf('--sandbox');
+    assert.notEqual(sandboxIdx, -1);
+    assert.equal(wsInvocation.args[sandboxIdx + 1], 'workspace-write');
+    assert.ok(wsInvocation.args.includes('web_search="disabled"'));
+    assert.ok(wsInvocation.args.includes('sandbox_workspace_write.network_access=false'));
+    assert.ok(wsInvocation.args.includes('features.apps=false'));
+    assert.ok(wsInvocation.args.includes('features.plugins=false'));
+    assert.ok(wsInvocation.args.includes('features.remote_plugin=false'));
+    assert.ok(wsInvocation.args.includes('features.browser_use=false'));
+    assert.ok(wsInvocation.args.includes('features.browser_use_external=false'));
+    assert.match(wsInvocation.agentPrompt, /workspace-write sandbox mode/);
+
+    const fullWarning = detectSandboxErrorMessage(['sandbox-exec: Operation not permitted'], 'full-access');
+    assert.ok(fullWarning);
+    assert.match(fullWarning, /outer|sandboxed shell|Restart codex-markup/i);
+
+    const wsWarning = detectSandboxErrorMessage(['curl: (6) Could not resolve host: example.com'], 'workspace-write');
+    assert.ok(wsWarning);
+    assert.match(wsWarning, /workspace-write|Switch to Full Access/i);
+
+    const epermWarning = detectSandboxErrorMessage(['Error: EPERM: operation not permitted, open /etc/hosts'], 'workspace-write');
+    assert.ok(epermWarning);
+
+    assert.equal(detectSandboxErrorMessage(['Updated styles', 'Done'], 'full-access'), undefined);
   });
 });
 

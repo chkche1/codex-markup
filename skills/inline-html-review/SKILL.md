@@ -19,6 +19,8 @@ Call the `open_html_review` MCP tool:
 - `open_browser`: `true`
 - `wait_for_submission`: set to `true` if you want to immediately wait for the user to add inline comments and click **"🚀 Submit to Codex"** in the browser.
 
+> **Permissions note:** When Codex is actively listening via `wait_for_review` or `open_html_review(wait_for_submission: true)` (or CLI `wait`), execution permissions come from the connected Codex session itself, and the browser dock displays a read-only **Session Sandbox** badge.
+
 #### If using CLI commands (without MCP):
 ```bash
 # Start the server and open the browser in the background
