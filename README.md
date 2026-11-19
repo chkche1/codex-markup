@@ -34,7 +34,11 @@ This opens [the example dashboard](examples/demo.html) at `http://127.0.0.1:4321
 3. Click **Submit to Codex** when your queued feedback is ready.
 4. Watch the preview update and read Codex's replies in the threads.
 
-Submitting feedback starts a background Codex CLI run unless a connected Codex session is already waiting for the review. Background runs use `workspace-write` sandboxing by default. The **Full Access** toggle removes sandbox and approval restrictions; enable it only when your task requires that access.
+Submitting feedback works differently depending on how the server is running:
+
+- **Connected Codex session (MCP / `wait`):** feedback returns directly to your active Codex CLI or Codex Desktop session and runs under that session's sandbox permissions. The browser dock displays a read-only **Session Sandbox** badge.
+- **Standalone background runs (`serve` / `demo`):** when no session is listening, `codex-markup` launches a local `codex exec` run. For local convenience, standalone unsandboxed servers default to **Full Access** (`--dangerously-bypass-approvals-and-sandbox`), indicated in the dock and CLI startup output. Click the toolbar badge or launch with `--sandbox workspace-write` (or `CODEX_MARKUP_SANDBOX=workspace-write`) to restrict writes to the enclosing Git/project root with no network.
+- **Externally sandboxed / policy-restricted hosts:** if the server was launched inside an outer OS sandbox or a managed `/etc/codex/requirements.toml` policy restricts `danger-full-access`, the toolbar locks to a read-only **Host Sandboxed** or **Policy Sandboxed** badge explaining why.
 
 Voice input is available when your browser supports speech recognition.
 

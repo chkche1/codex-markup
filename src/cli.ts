@@ -8,6 +8,7 @@ import {
   ensureReviewServer,
   openInBrowser,
   resolveDefaultSandboxMode,
+  type SandboxCapabilities,
 } from './server.ts';
 import { startMcpServer } from './mcp.ts';
 import {
@@ -73,13 +74,34 @@ COMMANDS:
 
 OPTIONS:
   -p, --port <number>             Port for local review server (default: ${DEFAULT_PORT})
-  --sandbox <mode>                Background codex exec sandbox: workspace-write (default) | full-access
+  --sandbox <mode>                Background codex exec mode: full-access (default when unsandboxed) | workspace-write
   --no-open                       Do not automatically open the browser on 'serve'
   -h, --help                      Show this help message
 
 QUICK START:
   node --no-warnings ${cliPath} serve examples/demo.html
 `);
+}
+
+function printSandboxStatus(caps?: SandboxCapabilities) {
+  if (!caps) return;
+  if (caps.controlSource === 'externally-sandboxed') {
+    console.log(
+      `🔒 Outer sandbox detected (${caps.externalSandboxSignal}): Full Access unavailable. Start from an unsandboxed terminal if unrestricted access is needed.`
+    );
+  } else if (caps.controlSource === 'policy-restricted') {
+    console.log('🔒 System Codex policy restricts Full Access (running in workspace-write).');
+  } else if (caps.controlSource === 'connected-session') {
+    console.log('🔗 Connected Codex session controls sandbox permissions while listening.');
+  } else if (caps.effectiveMode === 'full-access') {
+    console.log(
+      '🔓 Background Codex mode: full-access (local machine access; pass --sandbox workspace-write to restrict)'
+    );
+  } else {
+    console.log(
+      `🔒 Background Codex mode: workspace-write (root: ${caps.workspaceRoot}; pass --sandbox full-access for unrestricted access)`
+    );
+  }
 }
 
 function installForCodex(customCodexHome?: string) {
@@ -275,16 +297,21 @@ async function main() {
     child.unref();
 
     const baseUrl = `http://127.0.0.1:${port}`;
+    let healthData: { sandbox?: SandboxCapabilities } | undefined;
     for (let i = 0; i < 25; i++) {
       await new Promise((r) => setTimeout(r, 150));
       try {
         const res = await fetch(`${baseUrl}/__inline_review__/api/health`);
-        if (res.ok) break;
+        if (res.ok) {
+          healthData = (await res.json()) as { sandbox?: SandboxCapabilities };
+          break;
+        }
       } catch {
         // Keep waiting
       }
     }
     console.log(`✨ Restarted Codex Inline Review Server on ${baseUrl} (PID ${child.pid}, logs: ${logFile})`);
+    printSandboxStatus(healthData?.sandbox);
 
     if (targetFile) {
       const submitRes = await fetch(`${baseUrl}/__inline_review__/api/submit`, {
@@ -320,6 +347,7 @@ async function main() {
       const actualPort = await srv.start();
       const reviewUrl = srv.getReviewUrl(targetFile);
       console.log(`✨ Codex Inline Review Server running at: http://127.0.0.1:${actualPort}`);
+      printSandboxStatus(srv.getSandboxCapabilities(targetFile));
       if (targetFile) {
         console.log(`📄 Reviewing HTML file: ${targetFile}`);
         console.log(`🔗 Review URL: ${reviewUrl}`);
@@ -339,6 +367,33 @@ async function main() {
         const data = (await res.json()) as { reviewUrl: string };
         console.log(`✨ Connected to existing Review Server at ${baseUrl}`);
         console.log(`🔗 Opened: ${data.reviewUrl}`);
+        if (sandboxMode) {
+          const sandboxRes = await fetch(`${baseUrl}/__inline_review__/api/sandbox`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file: targetFile, sandboxMode }),
+          });
+          const sandboxData = (await sandboxRes.json()) as {
+            applied?: boolean;
+            error?: string;
+            sandbox?: SandboxCapabilities;
+          };
+          if (sandboxData.applied === false) {
+            console.warn(`⚠️ Could not change sandbox mode on existing server: ${sandboxData.error}`);
+          } else {
+            printSandboxStatus(sandboxData.sandbox);
+          }
+        } else {
+          try {
+            const healthRes = await fetch(`${baseUrl}/__inline_review__/api/health`);
+            if (healthRes.ok) {
+              const healthData = (await healthRes.json()) as { sandbox?: SandboxCapabilities };
+              printSandboxStatus(healthData.sandbox);
+            }
+          } catch {
+            // Ignore health check failure
+          }
+        }
       } else {
         throw err;
       }

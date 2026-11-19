@@ -21,13 +21,209 @@ import { getWidgetScript } from './widget.ts';
 
 export const DEFAULT_PORT = Number(process.env.CODEX_REVIEW_PORT || 4321);
 export type CodexSandboxMode = 'workspace-write' | 'full-access';
+export type SandboxControlSource =
+  | 'background-codex'
+  | 'connected-session'
+  | 'externally-sandboxed'
+  | 'policy-restricted';
 
-export function resolveDefaultSandboxMode(mode?: string): CodexSandboxMode {
-  const raw = mode || process.env.CODEX_MARKUP_SANDBOX;
+export interface SandboxCapabilities {
+  configuredMode: CodexSandboxMode;
+  effectiveMode: CodexSandboxMode | 'session-controlled' | 'externally-sandboxed';
+  controlSource: SandboxControlSource;
+  canToggle: boolean;
+  label: string;
+  reason: string;
+  hint?: string;
+  workspaceRoot?: string;
+  externalSandboxSignal?: string;
+  restartCommand?: string;
+}
+
+export interface InlineReviewServerOptions {
+  env?: NodeJS.ProcessEnv;
+  requirementsPath?: string;
+}
+
+export function detectExternalSandbox(
+  env: NodeJS.ProcessEnv = process.env
+): { sandboxed: boolean; signal?: string } {
+  const codexSandbox = (env.CODEX_SANDBOX || '').trim();
+  if (
+    codexSandbox &&
+    !['none', 'off', '0', 'false', 'danger-full-access'].includes(codexSandbox.toLowerCase())
+  ) {
+    return { sandboxed: true, signal: `CODEX_SANDBOX=${codexSandbox}` };
+  }
+
+  const netDisabled = (env.CODEX_SANDBOX_NETWORK_DISABLED || '').trim();
+  if (netDisabled === '1' || netDisabled.toLowerCase() === 'true') {
+    return { sandboxed: true, signal: `CODEX_SANDBOX_NETWORK_DISABLED=${netDisabled}` };
+  }
+
+  const extSandbox = (env.CODEX_MARKUP_EXTERNAL_SANDBOX || '').trim();
+  if (extSandbox === '1' || extSandbox.toLowerCase() === 'true') {
+    return { sandboxed: true, signal: `CODEX_MARKUP_EXTERNAL_SANDBOX=${extSandbox}` };
+  }
+
+  const seatbeltProfile = (env.SEATBELT_PROFILE || '').trim();
+  if (seatbeltProfile) {
+    return { sandboxed: true, signal: 'SEATBELT_PROFILE' };
+  }
+
+  return { sandboxed: false };
+}
+
+export function detectPolicyFullAccessBlocked(
+  requirementsPath?: string,
+  env: NodeJS.ProcessEnv = process.env
+): { blocked: boolean; path?: string } {
+  const reqPath = requirementsPath ?? env.CODEX_REQUIREMENTS_PATH ?? '/etc/codex/requirements.toml';
+  try {
+    if (!fs.existsSync(reqPath)) {
+      return { blocked: false };
+    }
+    const raw = fs.readFileSync(reqPath, 'utf8');
+    const stripped = raw.replace(/#.*$/gm, '');
+    const match = stripped.match(/allowed_sandbox_modes\s*=\s*\[([\s\S]*?)\]/);
+    if (match && !/['"]danger-full-access['"]/.test(match[1])) {
+      return { blocked: true, path: reqPath };
+    }
+  } catch {
+    return { blocked: false };
+  }
+  return { blocked: false };
+}
+
+export function resolveWorkspaceRoot(filePath: string): string {
+  const startDir = path.dirname(path.resolve(filePath));
+  const homeDir = path.resolve(os.homedir());
+  let cur = startDir;
+  while (true) {
+    if (cur === homeDir && startDir !== homeDir) {
+      return startDir;
+    }
+    if (fs.existsSync(path.join(cur, '.git'))) {
+      return cur;
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) {
+      return startDir;
+    }
+    cur = parent;
+  }
+}
+
+export function resolveDefaultSandboxMode(
+  mode?: string,
+  env: NodeJS.ProcessEnv = process.env,
+  requirementsPath?: string
+): CodexSandboxMode {
+  const raw = (mode ?? env.CODEX_MARKUP_SANDBOX ?? '').trim().toLowerCase();
+  if (raw === 'workspace-write' || raw === 'sandboxed' || raw === 'read-only') {
+    return 'workspace-write';
+  }
   if (raw === 'full-access' || raw === 'danger-full-access') {
     return 'full-access';
   }
-  return 'workspace-write';
+  if (
+    detectExternalSandbox(env).sandboxed ||
+    detectPolicyFullAccessBlocked(requirementsPath, env).blocked
+  ) {
+    return 'workspace-write';
+  }
+  return 'full-access';
+}
+
+export function buildBackgroundCodexInvocation(opts: {
+  filePath: string;
+  reviewReport: string;
+  sandboxMode: CodexSandboxMode;
+  nodeBin: string;
+  cliPath: string;
+  tmpOutFile: string;
+}): { workDir: string; args: string[]; agentPrompt: string } {
+  const resolved = path.resolve(opts.filePath);
+  const workDir = resolveWorkspaceRoot(resolved);
+  const sandboxArgs =
+    opts.sandboxMode === 'full-access'
+      ? ['--dangerously-bypass-approvals-and-sandbox', '-c', 'web_search="live"']
+      : [
+          '--sandbox',
+          'workspace-write',
+          '-c',
+          'web_search="disabled"',
+          '-c',
+          'sandbox_workspace_write.network_access=false',
+          '-c',
+          'features.apps=false',
+          '-c',
+          'features.plugins=false',
+          '-c',
+          'features.remote_plugin=false',
+          '-c',
+          'features.browser_use=false',
+          '-c',
+          'features.browser_use_external=false',
+        ];
+
+  const args = [
+    'exec',
+    '--ephemeral',
+    '-c',
+    'mcp_servers={}',
+    ...sandboxArgs,
+    '--skip-git-repo-check',
+    '-C',
+    workDir,
+    '--output-last-message',
+    opts.tmpOutFile,
+    '-',
+  ];
+
+  const instruction2 =
+    opts.sandboxMode === 'full-access'
+      ? `2. Edit ${resolved} (and any related files requested by the comments) directly.`
+      : `2. Edit ${resolved} (and any related files inside ${workDir} if requested by the comments) directly.`;
+
+  const instruction4 =
+    opts.sandboxMode === 'full-access'
+      ? `4. You are running in Full Access mode (workspace root: ${workDir}). If an inline comment asks you to inspect other local files, reference project code, fetch web assets, or run commands, you may do so directly. Avoid unrelated repository builds or test suites unless an inline comment asks for them.`
+      : `4. You are running in workspace-write sandbox mode (writable root: ${workDir}, network disabled). Focus on ${resolved} and related files in ${workDir}; do NOT run unrelated repository builds or test suites unless a comment asks for them. If a comment requires network access or writes outside ${workDir} that your sandbox blocks, explain that clearly in your inline reply.`;
+
+  const agentPrompt = [
+    `You are responding to inline review comments left by the user on the HTML file: ${resolved}`,
+    ``,
+    opts.reviewReport,
+    ``,
+    `IMPORTANT INSTRUCTIONS:`,
+    `1. Start by reading ${resolved} to understand the context of each open comment.`,
+    instruction2,
+    `3. For EVERY open comment thread listed above, you MUST post your reply back to the inline thread by running:`,
+    `   ${opts.nodeBin} --no-warnings ${opts.cliPath} reply ${JSON.stringify(resolved)} <comment-id> "<your detailed answer or summary of changes>" --resolve`,
+    `   (Omit --resolve if you are only answering a question and want to keep the thread open/answered for follow-up.)`,
+    instruction4,
+  ].join('\n');
+
+  return { workDir, args, agentPrompt };
+}
+
+export function detectSandboxErrorMessage(
+  lines: string[],
+  sandboxMode: CodexSandboxMode
+): string | undefined {
+  const joined = lines.join('\n');
+  if (
+    !/operation not permitted|\beperm\b|sandbox-exec|seatbelt|landlock|read-only file system|allowed_sandbox_modes|blocked by.*policy|network.*disabled|could not resolve host|sandbox.*denied/i.test(
+      joined
+    )
+  ) {
+    return undefined;
+  }
+  if (sandboxMode === 'full-access') {
+    return 'Codex hit an OS sandbox or policy restriction even in Full Access mode. The review server may have been started inside a sandboxed shell, or a system Codex policy is enforcing restrictions. Restart codex-markup from a normal terminal if unrestricted access is needed.';
+  }
+  return 'Codex was blocked by workspace-write sandbox restrictions (no network or writes outside the workspace). Switch to Full Access in the toolbar (when standalone) or adjust your Codex session permissions.';
 }
 
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
@@ -80,10 +276,19 @@ export class InlineReviewServer {
   private watchedFiles = new Map<string, fs.FSWatcher>();
   private activeCodexRuns = new Map<string, { startedAt: string; statusText: string }>();
   private sandboxMode: CodexSandboxMode;
+  private env: NodeJS.ProcessEnv;
+  private requirementsPath?: string;
 
-  constructor(port = DEFAULT_PORT, initialFile?: string, sandboxMode?: CodexSandboxMode) {
+  constructor(
+    port = DEFAULT_PORT,
+    initialFile?: string,
+    sandboxMode?: CodexSandboxMode,
+    options?: InlineReviewServerOptions
+  ) {
     this.port = port;
-    this.sandboxMode = resolveDefaultSandboxMode(sandboxMode);
+    this.env = options?.env ?? process.env;
+    this.requirementsPath = options?.requirementsPath;
+    this.sandboxMode = resolveDefaultSandboxMode(sandboxMode, this.env, this.requirementsPath);
     if (initialFile) {
       this.setActiveFile(initialFile);
     }
@@ -116,6 +321,83 @@ export class InlineReviewServer {
     return `http://127.0.0.1:${this.port}/review?file=${encodeURIComponent(target)}`;
   }
 
+  public getSandboxCapabilities(filePath?: string | null): SandboxCapabilities {
+    const targetFile = filePath ? path.resolve(filePath) : this.activeFilePath;
+    const waitingCount = targetFile ? this.getWaitersCount(targetFile) : this.waiters.size;
+    const workspaceRoot = targetFile ? resolveWorkspaceRoot(targetFile) : process.cwd();
+    const cliPath = path.resolve(import.meta.dirname || '.', 'cli.ts');
+    const restartCommand = targetFile
+      ? `node --no-warnings ${cliPath} restart ${JSON.stringify(targetFile)}`
+      : `node --no-warnings ${cliPath} restart`;
+
+    if (waitingCount > 0) {
+      return {
+        configuredMode: this.sandboxMode,
+        effectiveMode: 'session-controlled',
+        controlSource: 'connected-session',
+        canToggle: false,
+        label: 'Session Sandbox',
+        reason:
+          'Controlled by your connected Codex session. Submissions go directly to the listening Codex CLI/Desktop session and run under its own sandbox permissions.',
+        hint:
+          'To allow network or access outside the workspace, change permissions in your Codex session (e.g., Full Access in Codex Desktop or --sandbox danger-full-access in Codex CLI).',
+        workspaceRoot,
+      };
+    }
+
+    const ext = detectExternalSandbox(this.env);
+    if (ext.sandboxed) {
+      return {
+        configuredMode: this.sandboxMode,
+        effectiveMode: 'externally-sandboxed',
+        controlSource: 'externally-sandboxed',
+        canToggle: false,
+        label: 'Host Sandboxed',
+        reason: `This review server was launched inside an outer OS sandbox (${ext.signal}). Child processes cannot escape an outer sandbox, so Full Access cannot be enabled here.`,
+        hint: 'Restart codex-markup from an unsandboxed terminal to enable Full Access.',
+        workspaceRoot,
+        externalSandboxSignal: ext.signal,
+        restartCommand,
+      };
+    }
+
+    const policy = detectPolicyFullAccessBlocked(this.requirementsPath, this.env);
+    if (policy.blocked) {
+      return {
+        configuredMode: this.sandboxMode,
+        effectiveMode: 'workspace-write',
+        controlSource: 'policy-restricted',
+        canToggle: false,
+        label: 'Policy Sandboxed',
+        reason: `System Codex policy (${policy.path}) restricts danger-full-access, so background runs stay in workspace-write sandbox mode.`,
+        hint: 'Update your Codex requirements policy if Full Access is permitted on this machine.',
+        workspaceRoot,
+      };
+    }
+
+    if (this.sandboxMode === 'full-access') {
+      return {
+        configuredMode: this.sandboxMode,
+        effectiveMode: 'full-access',
+        controlSource: 'background-codex',
+        canToggle: true,
+        label: 'Full Access',
+        reason: `Standalone background Codex runs with Full Access (--dangerously-bypass-approvals-and-sandbox): can read/write local files, access the network, and run commands. Workspace root: ${workspaceRoot}. Click to switch to Sandboxed.`,
+        workspaceRoot,
+      };
+    }
+
+    return {
+      configuredMode: this.sandboxMode,
+      effectiveMode: 'workspace-write',
+      controlSource: 'background-codex',
+      canToggle: true,
+      label: 'Sandboxed',
+      reason: `Standalone background Codex runs in workspace-write sandbox (writable root: ${workspaceRoot}, no network). Click to switch to Full Access.`,
+      workspaceRoot,
+    };
+  }
+
   public async start(): Promise<number> {
     return new Promise((resolve, reject) => {
       const onError = (err: NodeJS.ErrnoException) => {
@@ -138,6 +420,10 @@ export class InlineReviewServer {
   }
 
   public stop(): Promise<void> {
+    for (const w of this.waiters) {
+      if (w.timer) clearTimeout(w.timer);
+    }
+    this.waiters.clear();
     for (const watcher of this.watchedFiles.values()) {
       watcher.close();
     }
@@ -153,21 +439,47 @@ export class InlineReviewServer {
 
   public waitForSubmission(
     filePath: string,
-    timeoutMs = 600_000
+    timeoutMs = 600_000,
+    signal?: AbortSignal
   ): Promise<{ state: ReviewDocumentState; prompt: string }> {
     const resolved = this.setActiveFile(filePath);
+    if (signal?.aborted) {
+      const state = loadReviewState(resolved);
+      const prompt = formatReviewForCodex(resolved, 'open');
+      return Promise.resolve({ state, prompt });
+    }
     return new Promise((resolve) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        if (waiter.timer) clearTimeout(waiter.timer);
+        this.waiters.delete(waiter);
+        this.broadcastWaitersCount(resolved);
+        const state = loadReviewState(resolved);
+        const prompt = formatReviewForCodex(resolved, 'open');
+        resolve({ state, prompt });
+      };
       const waiter: PendingWaiter = {
         filePath: resolved,
         resolve: (res) => {
+          if (settled) return;
+          settled = true;
+          if (signal) signal.removeEventListener('abort', onAbort);
           if (waiter.timer) clearTimeout(waiter.timer);
           this.waiters.delete(waiter);
           this.broadcastWaitersCount(resolved);
           resolve(res);
         },
       };
+      if (signal) {
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
       if (timeoutMs > 0) {
         waiter.timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          if (signal) signal.removeEventListener('abort', onAbort);
           this.waiters.delete(waiter);
           this.broadcastWaitersCount(resolved);
           const state = loadReviewState(resolved);
@@ -195,7 +507,10 @@ export class InlineReviewServer {
 
   private broadcastWaitersCount(filePath: string) {
     const count = this.getWaitersCount(filePath);
-    this.broadcastSSE(filePath, 'waiters-updated', { waitingAgentsCount: count });
+    this.broadcastSSE(filePath, 'waiters-updated', {
+      waitingAgentsCount: count,
+      sandbox: this.getSandboxCapabilities(filePath),
+    });
   }
 
   private broadcastSSE(filePath: string, event: string, data: unknown) {
@@ -394,6 +709,7 @@ export class InlineReviewServer {
         port: this.port,
         activeFilePath: this.activeFilePath,
         sandboxMode: this.sandboxMode,
+        sandbox: this.getSandboxCapabilities(this.activeFilePath),
       });
       return;
     }
@@ -406,6 +722,7 @@ export class InlineReviewServer {
         waitingAgentsCount: this.getWaitersCount(file),
         codexRun: this.activeCodexRuns.get(file) || null,
         sandboxMode: this.sandboxMode,
+        sandbox: this.getSandboxCapabilities(file),
       });
       return;
     }
@@ -496,26 +813,50 @@ export class InlineReviewServer {
     }
 
     if (endpoint === '/sandbox' && req.method === 'POST') {
+      const targetFile = typeof body.file === 'string' ? this.setActiveFile(body.file) : this.activeFilePath;
+      const currentCaps = this.getSandboxCapabilities(targetFile);
+      if (!currentCaps.canToggle) {
+        this.logEvent(
+          `[API /sandbox] Blocked toggle (controlSource=${currentCaps.controlSource}, sandboxMode=${this.sandboxMode})`
+        );
+        this.sendJson(res, 200, {
+          ok: false,
+          applied: false,
+          error: currentCaps.reason,
+          sandboxMode: this.sandboxMode,
+          sandbox: currentCaps,
+        });
+        return;
+      }
+
       const requested = typeof body.sandboxMode === 'string' ? body.sandboxMode : undefined;
-      this.sandboxMode = requested === 'full-access' || requested === 'danger-full-access'
-        ? 'full-access'
-        : 'workspace-write';
-      const targetFile = typeof body.file === 'string' ? body.file : this.activeFilePath;
+      this.sandboxMode =
+        requested === 'full-access' || requested === 'danger-full-access'
+          ? 'full-access'
+          : 'workspace-write';
+      const nextCaps = this.getSandboxCapabilities(targetFile);
       this.logEvent(`[API /sandbox] sandboxMode=${this.sandboxMode}`);
       if (targetFile) {
         const resolved = this.setActiveFile(targetFile);
         this.broadcastSSE(resolved, 'comments-updated', {
           reason: 'sandbox-mode',
           sandboxMode: this.sandboxMode,
+          sandbox: nextCaps,
         });
       }
-      this.sendJson(res, 200, { ok: true, sandboxMode: this.sandboxMode });
+      this.sendJson(res, 200, {
+        ok: true,
+        applied: true,
+        sandboxMode: this.sandboxMode,
+        sandbox: nextCaps,
+      });
       return;
     }
 
     if (endpoint === '/submit' && req.method === 'POST') {
       const file = this.resolveRequestedFile(body.file as string);
-      if (typeof body.sandboxMode === 'string') {
+      const capsBefore = this.getSandboxCapabilities(file);
+      if (typeof body.sandboxMode === 'string' && capsBefore.canToggle) {
         this.sandboxMode =
           body.sandboxMode === 'full-access' || body.sandboxMode === 'danger-full-access'
             ? 'full-access'
@@ -545,15 +886,36 @@ export class InlineReviewServer {
         this.runBackgroundCodex(file, openThreads.map((t) => t.id));
       }
 
-      this.sendJson(res, 200, { ok: true, state, prompt, notifiedWaiters, spawnedCodex });
+      this.sendJson(res, 200, {
+        ok: true,
+        state,
+        prompt,
+        notifiedWaiters,
+        spawnedCodex,
+        sandbox: this.getSandboxCapabilities(file),
+      });
       return;
     }
 
     if (endpoint === '/wait' && req.method === 'POST') {
       const file = this.resolveRequestedFile(body.file as string);
       const timeoutMs = typeof body.timeoutMs === 'number' ? body.timeoutMs : 600_000;
-      const result = await this.waitForSubmission(file, timeoutMs);
-      this.sendJson(res, 200, { ok: true, ...result });
+      const abortController = new AbortController();
+      const onResClose = () => {
+        if (!res.writableEnded) {
+          abortController.abort();
+        }
+      };
+      res.on('close', onResClose);
+      try {
+        const result = await this.waitForSubmission(file, timeoutMs, abortController.signal);
+        if (res.writableEnded || res.destroyed) {
+          return;
+        }
+        this.sendJson(res, 200, { ok: true, ...result });
+      } finally {
+        res.off('close', onResClose);
+      }
       return;
     }
 
@@ -584,7 +946,7 @@ export class InlineReviewServer {
     this.broadcastSSE(resolved, 'agent-status', { running: true, ...runState });
 
     const candidateCodexBins = [
-      process.env.CODEX_CLI_PATH,
+      this.env.CODEX_CLI_PATH,
       '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
       '/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
       '/Applications/Codex.app/Contents/Resources/codex',
@@ -599,7 +961,6 @@ export class InlineReviewServer {
       : process.execPath;
 
     const cliPath = path.resolve(import.meta.dirname || '.', 'cli.ts');
-    const workDir = path.dirname(resolved);
     const tmpOutFile = path.join(os.tmpdir(), `codex-inline-reply-${Date.now()}.txt`);
     const reviewReport = formatReviewForCodex(resolved, 'open');
 
@@ -609,46 +970,26 @@ export class InlineReviewServer {
       beforeReplyCounts.set(t.id, t.messages.length);
     }
 
-    const agentPrompt = [
-      `You are responding to inline review comments left by the user on the HTML file: ${resolved}`,
-      ``,
+    const caps = this.getSandboxCapabilities(resolved);
+    const effectiveRunMode: CodexSandboxMode =
+      caps.effectiveMode === 'full-access' ? 'full-access' : 'workspace-write';
+
+    const { workDir, args, agentPrompt } = buildBackgroundCodexInvocation({
+      filePath: resolved,
       reviewReport,
-      ``,
-      `IMPORTANT INSTRUCTIONS:`,
-      `1. Read ONLY ${resolved} to understand the context of each open comment.`,
-      `2. If a comment requests a change to the document/HTML/diagram/styles, edit ${resolved} directly.`,
-      `3. For EVERY open comment thread listed above, you MUST post your reply back to the inline thread by running:`,
-      `   ${nodeBin} --no-warnings ${cliPath} reply ${JSON.stringify(resolved)} <comment-id> "<your detailed answer or summary of changes>" --resolve`,
-      `   (Omit --resolve if you are only answering a question and want to keep the thread open/answered for follow-up.)`,
-      `4. Scope strictly to ${resolved}: do NOT search the repository, do NOT read project AGENTS.md files, and do NOT run any repository build or test suites unless an inline comment explicitly asks you to.`,
-    ].join('\n');
+      sandboxMode: effectiveRunMode,
+      nodeBin,
+      cliPath,
+      tmpOutFile,
+    });
 
     const env = {
-      ...process.env,
-      PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || '/usr/bin:/bin'}`,
+      ...this.env,
+      PATH: `/opt/homebrew/bin:/usr/local/bin:${this.env.PATH || '/usr/bin:/bin'}`,
     };
 
-    const sandboxArgs =
-      this.sandboxMode === 'full-access'
-        ? ['--dangerously-bypass-approvals-and-sandbox']
-        : ['--sandbox', 'workspace-write'];
-
-    const args = [
-      'exec',
-      '--ephemeral',
-      '-c',
-      'mcp_servers={}',
-      ...sandboxArgs,
-      '--skip-git-repo-check',
-      '-C',
-      workDir,
-      '--output-last-message',
-      tmpOutFile,
-      '-',
-    ];
-
     this.logEvent(
-      `[runBackgroundCodex] Spawning ${codexBin} for ${resolved} (sandboxMode=${this.sandboxMode}, threads=${openThreadIds.join(',')}, promptBytes=${Buffer.byteLength(agentPrompt, 'utf8')})`
+      `[runBackgroundCodex] Spawning ${codexBin} for ${resolved} (sandboxMode=${effectiveRunMode}, workDir=${workDir}, threads=${openThreadIds.join(',')}, promptBytes=${Buffer.byteLength(agentPrompt, 'utf8')})`
     );
 
     const child = spawn(codexBin, args, {
@@ -658,12 +999,17 @@ export class InlineReviewServer {
     });
 
     let lastErrorLine = '';
+    const collectedLines: string[] = [];
 
     const handleStreamChunk = (source: 'stdout' | 'stderr', chunk: Buffer) => {
       const text = chunk.toString('utf8');
       for (const rawLine of text.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line) continue;
+        if (collectedLines.length >= 120) {
+          collectedLines.shift();
+        }
+        collectedLines.push(line);
         if (/\bERROR\b|unexpected status [45]\d\d/i.test(line)) {
           lastErrorLine = line;
         }
@@ -741,11 +1087,13 @@ export class InlineReviewServer {
       } catch (err) {
         console.error(`[${new Date().toISOString()}] [InlineReviewServer] Post-run check error:`, err);
       } finally {
+        const sandboxWarning = detectSandboxErrorMessage(collectedLines, effectiveRunMode);
         this.activeCodexRuns.delete(resolved);
         this.broadcastSSE(resolved, 'agent-status', {
           running: false,
           completed: code === 0 && !lastErrorLine,
           error: lastErrorLine || (code !== 0 ? `Codex exited with code ${code}` : undefined),
+          ...(sandboxWarning ? { sandboxWarning } : {}),
         });
       }
     });
