@@ -1968,8 +1968,7 @@ describe('Installation distribution and recovery', () => {
     assert.equal(fs.readFileSync(path.join(runtime, 'sentinel'), 'utf8'), 'old runtime');
     assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), config);
     await execFileAsync(process.execPath, [path.join(runtime, 'src', 'cli.ts'), 'doctor', '--codex-home', home]);
-    await execFileAsync('git', ['revert', '--no-edit', 'HEAD'], { cwd: remote, env: { ...process.env,
-      GIT_COMMITTER_NAME: 'Installation Test', GIT_COMMITTER_EMAIL: 'test@example.invalid' } });
+    await execFileAsync('git', ['-c', 'user.name=Installation Test', '-c', 'user.email=test@example.invalid', 'revert', '--no-edit', 'HEAD'], { cwd: remote });
     const workingCli = fs.readFileSync(path.join(remote, 'src', 'cli.ts'), 'utf8');
     fs.writeFileSync(path.join(remote, 'src', 'cli.ts'),
       `import failureFs from 'node:fs'; if (process.argv.includes(${JSON.stringify(home)})) { failureFs.writeFileSync(${JSON.stringify(path.join(home, 'config.toml'))}, 'partial configuration'); process.exit(1); }\n` + workingCli);
@@ -1979,8 +1978,7 @@ describe('Installation distribution and recovery', () => {
     assert.equal(fs.readFileSync(path.join(runtime, 'sentinel'), 'utf8'), 'old runtime');
     assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), config);
     await execFileAsync(process.execPath, [path.join(runtime, 'src', 'cli.ts'), 'doctor', '--codex-home', home]);
-    await execFileAsync('git', ['revert', '--no-edit', 'HEAD'], { cwd: remote, env: { ...process.env,
-      GIT_COMMITTER_NAME: 'Installation Test', GIT_COMMITTER_EMAIL: 'test@example.invalid' } });
+    await execFileAsync('git', ['-c', 'user.name=Installation Test', '-c', 'user.email=test@example.invalid', 'revert', '--no-edit', 'HEAD'], { cwd: remote });
     await execFileAsync('bash', [script], { env });
     assert.equal(fs.existsSync(path.join(runtime, 'sentinel')), false);
     assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), config);
