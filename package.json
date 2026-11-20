@@ -14,6 +14,8 @@
     "demo": "node --no-warnings src/cli.ts serve examples/demo.html",
     "test": "node --no-warnings --test test/eval.test.ts",
     "install-codex": "node --no-warnings src/cli.ts install",
+    "sync": "node --no-warnings src/cli.ts sync",
+    "update": "node --no-warnings src/cli.ts update",
     "doctor": "node --no-warnings src/cli.ts doctor",
     "uninstall-codex": "node --no-warnings src/cli.ts uninstall"
   },

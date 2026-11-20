@@ -66,3 +66,33 @@ For each open inline comment:
      ```bash
      node --no-warnings <path-to-codex-markup>/src/cli.ts reply <path/to/file.html> c-1 "Updated the CTA button gradient and increased padding." --resolve
      ```
+
+---
+
+## Maintenance (Verify, Update, Sync, Uninstall)
+
+When the user asks to check health, update, sync skills, switch skill scope, or uninstall `codex-markup`:
+
+```bash
+# 1. Inspect health, SHA-256 sync drift, and duplicate skill warnings
+node --no-warnings <path-to-codex-markup>/src/cli.ts doctor --json
+
+# 2. Check for upstream updates & local drift without modifying files
+node --no-warnings <path-to-codex-markup>/src/cli.ts update --check --json
+
+# 3. Apply updates on managed installs (stages, verifies, and rolls back on failure)
+node --no-warnings <path-to-codex-markup>/src/cli.ts update --json
+
+# 4. Sync skill/AGENTS.md/config.toml from current runtime (use after `git pull` on checkouts)
+node --no-warnings <path-to-codex-markup>/src/cli.ts sync --json
+
+# Optional: switch skill location cleanly to ~/.agents/skills (or back with `codex`)
+node --no-warnings <path-to-codex-markup>/src/cli.ts sync --skill-scope agents --json
+
+# 5. Uninstall (removes MCP config, active skill dir, AGENTS.md block, and owned runtime)
+node --no-warnings <path-to-codex-markup>/src/cli.ts uninstall --json
+```
+
+- **Checkout installs (`managed: false`):** `update` refuses to overwrite contributor checkouts; run `git pull` in the checkout first (if asked), then run `sync --json`.
+- **Edit protection:** If `customizedFiles` / `UserCustomizationError` is reported, do **not** pass `--force` automatically—ask the user before overwriting their edits.
+- **Codex restart:** Whenever `restartRequired` is `true` (after `install`, `update`, `sync`, or `uninstall`), remind the user to restart Codex so changes take effect.
