@@ -2082,6 +2082,107 @@ function makeRuntimeCopy(dir: string, version?: string): string {
 }
 
 describe('Suite 6 — Manifest v2, Sync, Self-Update, User-Edit Protection & Skill Scopes', () => {
+  it('keeps repeated sync unchanged and restarts only for integration or runtime changes', async () => {
+    const home = makeTempDir('noop-sync-home-');
+    const source = makeRuntimeCopy(makeTempDir('noop-sync-source-'));
+    const installed = await installForCodex({ sourceRoot: source, codexHome: home, copy: true, json: true });
+    const manifestPath = path.join(home, 'codex-markup-install.json');
+    const manifest = readInstallManifest(manifestPath);
+    assert.ok(manifest?.schemaVersion === 2);
+    manifest.installedAt = '2020-01-01T00:00:00.000Z';
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+    const before = fs.readFileSync(manifestPath);
+
+    for (let i = 0; i < 2; i++) {
+      const synced = await syncCodexSetup({ codexHome: home, json: true });
+      assert.equal(synced.status, 'up-to-date');
+      assert.equal(synced.restartRequired, false);
+      assert.deepEqual(synced.updatedFiles, []);
+      assert.deepEqual(fs.readFileSync(manifestPath), before);
+    }
+
+    // Repairing metadata alone does not require reloading the integration.
+    manifest.version = 'outdated metadata';
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+    const metadataSync = await syncCodexSetup({ codexHome: home, json: true });
+    assert.equal(metadataSync.status, 'synced');
+    assert.deepEqual(metadataSync.updatedFiles, [manifestPath]);
+    assert.equal(metadataSync.restartRequired, false);
+
+    // A runtime change still needs a restart even when only the manifest is written.
+    fs.appendFileSync(path.join(installed.installRoot, 'src', 'mcp.ts'), '\n// Runtime changed\n');
+    const runtimeSync = await syncCodexSetup({ codexHome: home, json: true });
+    assert.deepEqual(runtimeSync.updatedFiles, [manifestPath]);
+    assert.equal(runtimeSync.restartRequired, true);
+  });
+
+  it('protects edited skill files removed upstream until force is requested', async () => {
+    const home = makeTempDir('removed-edit-home-');
+    const source = makeRuntimeCopy(makeTempDir('removed-edit-source-'));
+    const sourceNotes = path.join(source, 'skills', 'inline-html-review', 'notes.txt');
+    fs.writeFileSync(sourceNotes, 'original notes');
+    const installed = await installForCodex({ sourceRoot: source, codexHome: home, copy: true, json: true });
+    const diskNotes = path.join(home, 'skills', 'inline-html-review', 'notes.txt');
+    fs.writeFileSync(diskNotes, 'user edited notes');
+    fs.unlinkSync(sourceNotes);
+
+    await assert.rejects(
+      () => updateInstallation({ codexHome: home, from: source, json: true }),
+      (err: unknown) => err instanceof UserCustomizationError && err.customizedFiles.includes(diskNotes)
+    );
+    assert.equal(fs.readFileSync(diskNotes, 'utf8'), 'user edited notes');
+
+    fs.unlinkSync(path.join(installed.installRoot, 'skills', 'inline-html-review', 'notes.txt'));
+    await assert.rejects(
+      () => syncCodexSetup({ codexHome: home, json: true }),
+      (err: unknown) => err instanceof UserCustomizationError && err.customizedFiles.includes(diskNotes)
+    );
+    assert.equal(fs.readFileSync(diskNotes, 'utf8'), 'user edited notes');
+    await syncCodexSetup({ codexHome: home, force: true, json: true });
+    assert.equal(fs.existsSync(diskNotes), false);
+  });
+
+  for (const entryPoint of ['update', 'install.sh']) {
+    it(`isolates ${entryPoint} verification from CODEX_MARKUP_AGENTS_DIR`, async () => {
+      const dir = makeTempDir('verify-agents-');
+      const source = makeRuntimeCopy(path.join(dir, 'source'));
+      const home = path.join(dir, 'home');
+      const runtime = path.join(dir, 'runtime');
+      const agentsDir = path.join(dir, 'agents');
+      await installForCodex({ sourceRoot: source, codexHome: home, installDir: runtime, skillScope: 'agents', agentsDir, json: true });
+      const skillPath = path.join(agentsDir, 'skills', 'inline-html-review', 'SKILL.md');
+      const before = fs.readFileSync(skillPath);
+      const pkgPath = path.join(source, 'package.json');
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      pkg.version = '1.0.1';
+      fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+      const env = {
+        ...process.env,
+        CODEX_HOME: home,
+        CODEX_MARKUP_DIR: runtime,
+        CODEX_MARKUP_AGENTS_DIR: agentsDir,
+        CODEX_MARKUP_SOURCE_DIR: '',
+        CODEX_MARKUP_REPO: source,
+        CODEX_MARKUP_BRANCH: 'main',
+        CODEX_REVIEW_PORT: '99999',
+      };
+      if (entryPoint === 'update') {
+        await execFileAsync(process.execPath, ['--no-warnings', CLI_ENTRY, 'update', '--codex-home', home, '--from', source, '--json'], { env });
+      } else {
+        await execFileAsync('git', ['init', '-b', 'main', source]);
+        await execFileAsync('git', ['add', '.'], { cwd: source });
+        await execFileAsync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'release'], { cwd: source });
+        await execFileAsync('bash', [path.join(REPO_ROOT, 'install.sh')], { env });
+      }
+      assert.deepEqual(fs.readFileSync(skillPath), before);
+      assert.equal(readInstallManifest(path.join(home, 'codex-markup-install.json'))?.schemaVersion, 2);
+      const doctor = await runDoctor({ codexHome: home, agentsDir, quiet: true });
+      assert.equal(doctor.ok, true);
+      assert.equal(doctor.needsSync, false);
+      assert.equal(doctor.version, '1.0.1');
+    });
+  }
+
   it('reads dynamic package.json version in src/mcp.ts initialize handshake', async () => {
     const repoPkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8')) as {
       version: string;

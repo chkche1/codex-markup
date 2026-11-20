@@ -1103,7 +1103,7 @@ export function inspectArtifactDrift(options: {
     for (const relPosix of Object.keys(diskSkillFiles)) {
       if (!(relPosix in expectedSkillFiles)) {
         const displayPath = path.join(skillDir, ...relPosix.split('/'));
-        if (prevV2 && (!prevMatchesTargetDir || !(relPosix in prevV2.artifacts.skillFiles))) {
+        if (prevV2 && (!prevMatchesTargetDir || diskSkillFiles[relPosix] !== prevV2.artifacts.skillFiles[relPosix])) {
           customizedFiles.push(displayPath);
         } else {
           behindFiles.push(displayPath);
@@ -2155,7 +2155,10 @@ export async function syncCodexSetup(options?: SyncOptions): Promise<SyncResult>
       state.manifestV2?.sourceBranch;
     const tarballUrl = cleanEnvValue(process.env.CODEX_MARKUP_TARBALL_URL) ?? state.manifestV2?.tarballUrl;
     const tarballEtag = cleanEnvValue(process.env.CODEX_MARKUP_TARBALL_ETAG) ?? state.manifestV2?.tarballEtag;
-    const installedAt = cleanEnvValue(process.env.CODEX_MARKUP_INSTALLED_AT) ?? new Date().toISOString();
+    const installedAt =
+      cleanEnvValue(process.env.CODEX_MARKUP_INSTALLED_AT) ??
+      state.manifestV2?.installedAt ??
+      new Date().toISOString();
 
     const nextManifest: InstallManifestV2 = {
       schemaVersion: 2,
@@ -2209,6 +2212,8 @@ export async function syncCodexSetup(options?: SyncOptions): Promise<SyncResult>
   }
 
   const didChange = updatedFiles.length > 0 || drift.needsSync;
+  const integrationChanged = updatedFiles.some((file) => file !== path.join(codexHome, MANIFEST));
+  const runtimeChanged = Boolean(state.manifestV2 && runtimeSha256 !== state.manifestV2.runtimeSha256);
   const result: SyncResult = {
     status: didChange ? 'synced' : 'up-to-date',
     codexHome,
@@ -2221,7 +2226,7 @@ export async function syncCodexSetup(options?: SyncOptions): Promise<SyncResult>
     updatedFiles,
     needsSync: false,
     customizedFiles: [],
-    restartRequired: updatedFiles.length > 0,
+    restartRequired: integrationChanged || runtimeChanged,
     doctor,
   };
 
@@ -2856,11 +2861,14 @@ export async function updateInstallation(
           '--copy',
           '--install-dir',
           verifyRuntime,
+          '--skill-scope',
+          'codex',
           '--json',
         ],
         {
           env: {
             ...process.env,
+            CODEX_MARKUP_AGENTS_DIR: '',
             CODEX_REVIEW_PORT: '99999',
           },
         }

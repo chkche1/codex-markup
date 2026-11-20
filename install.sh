@@ -182,8 +182,9 @@ else
 fi
 
 # Exercise the downloaded code before replacing the working runtime or real config.
-if ! "$NODE_BIN" --no-warnings "$work/runtime/src/cli.ts" install \
-  --codex-home "$work/verify-home" --copy --install-dir "$work/verify-runtime" >"$work/verify.log" 2>&1; then
+if ! CODEX_MARKUP_AGENTS_DIR= "$NODE_BIN" --no-warnings "$work/runtime/src/cli.ts" install \
+  --codex-home "$work/verify-home" --copy --install-dir "$work/verify-runtime" \
+  --skill-scope codex >"$work/verify.log" 2>&1; then
   cat "$work/verify.log" >&2
   exit 1
 fi
