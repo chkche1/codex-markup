@@ -4,7 +4,35 @@ set -euo pipefail
 codex_home="${CODEX_HOME:-$HOME/.codex}"
 install_dir="${CODEX_MARKUP_DIR:-$codex_home/tools/codex-markup}"
 REPO_URL="${CODEX_MARKUP_REPO:-https://github.com/chkche1/codex-markup.git}"
+BRANCH="${CODEX_MARKUP_BRANCH:-main}"
 TARBALL_URL="${CODEX_MARKUP_TARBALL:-https://github.com/chkche1/codex-markup/archive/refs/heads/main.tar.gz}"
+
+force_args=()
+case "$(printf '%s' "${CODEX_MARKUP_FORCE:-0}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes) force_args=(--force) ;;
+esac
+
+for arg in "$@"; do
+  case "$arg" in
+    --force)
+      force_args=(--force)
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: install.sh [--force]
+
+Options:
+  --force    Overwrite locally customized SKILL.md or AGENTS.md instructions
+  -h, --help Show this help message
+EOF
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg" >&2
+      exit 1
+      ;;
+  esac
+done
 
 is_supported_node() {
   local bin="$1"
@@ -70,7 +98,8 @@ if [ -n "${CODEX_MARKUP_SOURCE_DIR:-}" ]; then
   "$NODE_BIN" --no-warnings "$CODEX_MARKUP_SOURCE_DIR/src/cli.ts" install \
     --codex-home "$codex_home" \
     --copy \
-    --install-dir "$install_dir"
+    --install-dir "$install_dir" \
+    "${force_args[@]+"${force_args[@]}"}"
   exit 0
 fi
 
@@ -139,9 +168,11 @@ trap 'exit 143' TERM
 
 printf 'Downloading codex-markup…\n'
 TIMEFORMAT='Download: %3R s'
+downloaded_via="git"
 if command -v git >/dev/null 2>&1; then
-  time git clone --depth 1 --branch main --quiet "$REPO_URL" "$work/runtime"
+  time git clone --depth 1 --branch "$BRANCH" --quiet "$REPO_URL" "$work/runtime"
 elif command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+  downloaded_via="tarball"
   time curl -fsSL "$TARBALL_URL" -o "$work/runtime.tar.gz"
   mkdir -p "$work/runtime"
   tar -xzf "$work/runtime.tar.gz" --strip-components=1 -C "$work/runtime"
@@ -151,8 +182,9 @@ else
 fi
 
 # Exercise the downloaded code before replacing the working runtime or real config.
-if ! "$NODE_BIN" --no-warnings "$work/runtime/src/cli.ts" install \
-  --codex-home "$work/verify-home" --copy --install-dir "$work/verify-runtime" >"$work/verify.log" 2>&1; then
+if ! CODEX_MARKUP_AGENTS_DIR= "$NODE_BIN" --no-warnings "$work/runtime/src/cli.ts" install \
+  --codex-home "$work/verify-home" --copy --install-dir "$work/verify-runtime" \
+  --skill-scope codex >"$work/verify.log" 2>&1; then
   cat "$work/verify.log" >&2
   exit 1
 fi
@@ -174,5 +206,20 @@ const [runtimeRoot, codexHome] = process.argv.slice(2);
 fs.writeFileSync(path.join(runtimeRoot, '.codex-markup-owned.json'), JSON.stringify({ runtimeRoot, codexHome, managed: true }));
 JS
 registering=1
-"$NODE_BIN" --no-warnings "$install_dir/src/cli.ts" install --codex-home "$codex_home" --copy --install-dir "$install_dir"
+if [ "$downloaded_via" = "git" ]; then
+  source_commit="$(git -C "$install_dir" rev-parse HEAD 2>/dev/null || true)"
+  export CODEX_MARKUP_SOURCE_REPO="$REPO_URL"
+  export CODEX_MARKUP_SOURCE_BRANCH="$BRANCH"
+  if [ -n "$source_commit" ]; then
+    export CODEX_MARKUP_SOURCE_COMMIT="$source_commit"
+  fi
+else
+  export CODEX_MARKUP_TARBALL_URL="$TARBALL_URL"
+  unset CODEX_MARKUP_SOURCE_COMMIT || true
+fi
+"$NODE_BIN" --no-warnings "$install_dir/src/cli.ts" install \
+  --codex-home "$codex_home" \
+  --copy \
+  --install-dir "$install_dir" \
+  "${force_args[@]+"${force_args[@]}"}"
 success=1

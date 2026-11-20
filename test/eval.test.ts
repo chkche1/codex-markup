@@ -2,11 +2,12 @@ import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import fs from 'node:fs';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import { promisify } from 'node:util';
+import zlib from 'node:zlib';
 
 import {
   addRepliesBatch,
@@ -34,7 +35,20 @@ import {
   resolveWorkspaceRoot,
 } from '../src/server.ts';
 import { getWidgetScript } from '../src/widget.ts';
-import { isEphemeralCheckoutPath, isSupportedNodeVersion } from '../src/install.ts';
+import { readServerVersion } from '../src/mcp.ts';
+import {
+  UserCustomizationError,
+  computeRuntimeSha256,
+  copyRuntimeToDir,
+  installForCodex,
+  isEphemeralCheckoutPath,
+  isSupportedNodeVersion,
+  readInstallManifest,
+  runDoctor,
+  syncCodexSetup,
+  uninstallFromCodex,
+  updateInstallation,
+} from '../src/install.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -1984,5 +1998,866 @@ describe('Installation distribution and recovery', () => {
     assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), config);
     await execFileAsync(process.execPath, [path.join(runtime, 'src', 'cli.ts'), 'uninstall', '--codex-home', home]);
     assert.equal(fs.existsSync(runtime), false);
+  });
+});
+
+// =============================================================================
+// Suite 6 — Manifest v2, Sync, Self-Update, User-Edit Protection & Skill Scopes
+// =============================================================================
+
+function createUstarTarGz(
+  entries: Array<{ name: string; content?: Buffer | string; type?: 'file' | 'dir' | 'symlink' | 'hardlink'; linkname?: string }>
+): Buffer {
+  const blocks: Buffer[] = [];
+  const writeOctal = (buf: Buffer, offset: number, length: number, value: number) => {
+    const str = value.toString(8).padStart(length - 1, '0') + '\0';
+    buf.write(str, offset, length, 'ascii');
+  };
+
+  for (const entry of entries) {
+    const header = Buffer.alloc(512, 0);
+    const isDir = entry.type === 'dir';
+    const typeflag =
+      entry.type === 'symlink'
+        ? '2'
+        : entry.type === 'hardlink'
+          ? '1'
+          : isDir
+            ? '5'
+            : '0';
+    const data =
+      typeflag === '0'
+        ? Buffer.isBuffer(entry.content)
+          ? entry.content
+          : Buffer.from(entry.content ?? '', 'utf8')
+        : Buffer.alloc(0);
+
+    header.write(entry.name, 0, 100, 'utf8');
+    writeOctal(header, 100, 8, isDir ? 0o755 : 0o644);
+    writeOctal(header, 108, 8, 0);
+    writeOctal(header, 116, 8, 0);
+    writeOctal(header, 124, 12, data.length);
+    writeOctal(header, 136, 12, Math.floor(Date.now() / 1000));
+    header.fill(0x20, 148, 156); // checksum placeholder
+    header.write(typeflag, 156, 1, 'ascii');
+    if (entry.linkname) {
+      header.write(entry.linkname, 157, 100, 'utf8');
+    }
+    header.write('ustar\0', 257, 6, 'ascii');
+    header.write('00', 263, 2, 'ascii');
+
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += header[i];
+    header.write(sum.toString(8).padStart(6, '0') + '\0 ', 148, 8, 'ascii');
+    blocks.push(header);
+
+    if (data.length > 0) {
+      blocks.push(data);
+      const rem = data.length % 512;
+      if (rem !== 0) {
+        blocks.push(Buffer.alloc(512 - rem, 0));
+      }
+    }
+  }
+  blocks.push(Buffer.alloc(1024, 0));
+  return zlib.gzipSync(Buffer.concat(blocks));
+}
+
+function makeRuntimeCopy(dir: string, version?: string): string {
+  fs.cpSync(REPO_ROOT, dir, {
+    recursive: true,
+    filter: (entry) => {
+      const base = path.basename(entry);
+      return !['.git', 'node_modules', 'README.html', 'README.html.comments.json'].includes(base) &&
+        !base.endsWith('.comments.json');
+    },
+  });
+  if (version) {
+    const pkgPath = path.join(dir, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as Record<string, unknown>;
+    pkg.version = version;
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+  }
+  return dir;
+}
+
+describe('Suite 6 — Manifest v2, Sync, Self-Update, User-Edit Protection & Skill Scopes', () => {
+  it('keeps repeated sync unchanged and restarts only for integration or runtime changes', async () => {
+    const home = makeTempDir('noop-sync-home-');
+    const source = makeRuntimeCopy(makeTempDir('noop-sync-source-'));
+    const installed = await installForCodex({ sourceRoot: source, codexHome: home, copy: true, json: true });
+    const manifestPath = path.join(home, 'codex-markup-install.json');
+    const manifest = readInstallManifest(manifestPath);
+    assert.ok(manifest?.schemaVersion === 2);
+    manifest.installedAt = '2020-01-01T00:00:00.000Z';
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+    const before = fs.readFileSync(manifestPath);
+
+    for (let i = 0; i < 2; i++) {
+      const synced = await syncCodexSetup({ codexHome: home, json: true });
+      assert.equal(synced.status, 'up-to-date');
+      assert.equal(synced.restartRequired, false);
+      assert.deepEqual(synced.updatedFiles, []);
+      assert.deepEqual(fs.readFileSync(manifestPath), before);
+    }
+
+    // Repairing metadata alone does not require reloading the integration.
+    manifest.version = 'outdated metadata';
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+    const metadataSync = await syncCodexSetup({ codexHome: home, json: true });
+    assert.equal(metadataSync.status, 'synced');
+    assert.deepEqual(metadataSync.updatedFiles, [manifestPath]);
+    assert.equal(metadataSync.restartRequired, false);
+
+    // A runtime change still needs a restart even when only the manifest is written.
+    fs.appendFileSync(path.join(installed.installRoot, 'src', 'mcp.ts'), '\n// Runtime changed\n');
+    const runtimeSync = await syncCodexSetup({ codexHome: home, json: true });
+    assert.deepEqual(runtimeSync.updatedFiles, [manifestPath]);
+    assert.equal(runtimeSync.restartRequired, true);
+  });
+
+  it('protects edited skill files removed upstream until force is requested', async () => {
+    const home = makeTempDir('removed-edit-home-');
+    const source = makeRuntimeCopy(makeTempDir('removed-edit-source-'));
+    const sourceNotes = path.join(source, 'skills', 'inline-html-review', 'notes.txt');
+    fs.writeFileSync(sourceNotes, 'original notes');
+    const installed = await installForCodex({ sourceRoot: source, codexHome: home, copy: true, json: true });
+    const diskNotes = path.join(home, 'skills', 'inline-html-review', 'notes.txt');
+    fs.writeFileSync(diskNotes, 'user edited notes');
+    fs.unlinkSync(sourceNotes);
+
+    await assert.rejects(
+      () => updateInstallation({ codexHome: home, from: source, json: true }),
+      (err: unknown) => err instanceof UserCustomizationError && err.customizedFiles.includes(diskNotes)
+    );
+    assert.equal(fs.readFileSync(diskNotes, 'utf8'), 'user edited notes');
+
+    fs.unlinkSync(path.join(installed.installRoot, 'skills', 'inline-html-review', 'notes.txt'));
+    await assert.rejects(
+      () => syncCodexSetup({ codexHome: home, json: true }),
+      (err: unknown) => err instanceof UserCustomizationError && err.customizedFiles.includes(diskNotes)
+    );
+    assert.equal(fs.readFileSync(diskNotes, 'utf8'), 'user edited notes');
+    await syncCodexSetup({ codexHome: home, force: true, json: true });
+    assert.equal(fs.existsSync(diskNotes), false);
+  });
+
+  for (const entryPoint of ['update', 'install.sh']) {
+    it(`isolates ${entryPoint} verification from CODEX_MARKUP_AGENTS_DIR`, async () => {
+      const dir = makeTempDir('verify-agents-');
+      const source = makeRuntimeCopy(path.join(dir, 'source'));
+      const home = path.join(dir, 'home');
+      const runtime = path.join(dir, 'runtime');
+      const agentsDir = path.join(dir, 'agents');
+      await installForCodex({ sourceRoot: source, codexHome: home, installDir: runtime, skillScope: 'agents', agentsDir, json: true });
+      const skillPath = path.join(agentsDir, 'skills', 'inline-html-review', 'SKILL.md');
+      const before = fs.readFileSync(skillPath);
+      const pkgPath = path.join(source, 'package.json');
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      pkg.version = '1.0.1';
+      fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+      const env = {
+        ...process.env,
+        CODEX_HOME: home,
+        CODEX_MARKUP_DIR: runtime,
+        CODEX_MARKUP_AGENTS_DIR: agentsDir,
+        CODEX_MARKUP_SOURCE_DIR: '',
+        CODEX_MARKUP_REPO: source,
+        CODEX_MARKUP_BRANCH: 'main',
+        CODEX_REVIEW_PORT: '99999',
+      };
+      if (entryPoint === 'update') {
+        await execFileAsync(process.execPath, ['--no-warnings', CLI_ENTRY, 'update', '--codex-home', home, '--from', source, '--json'], { env });
+      } else {
+        await execFileAsync('git', ['init', '-b', 'main', source]);
+        await execFileAsync('git', ['add', '.'], { cwd: source });
+        await execFileAsync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'release'], { cwd: source });
+        await execFileAsync('bash', [path.join(REPO_ROOT, 'install.sh')], { env });
+      }
+      assert.deepEqual(fs.readFileSync(skillPath), before);
+      assert.equal(readInstallManifest(path.join(home, 'codex-markup-install.json'))?.schemaVersion, 2);
+      const doctor = await runDoctor({ codexHome: home, agentsDir, quiet: true });
+      assert.equal(doctor.ok, true);
+      assert.equal(doctor.needsSync, false);
+      assert.equal(doctor.version, '1.0.1');
+    });
+  }
+
+  it('reads dynamic package.json version in src/mcp.ts initialize handshake', async () => {
+    const repoPkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8')) as {
+      version: string;
+    };
+    assert.equal(readServerVersion(), repoPkg.version);
+
+    const staged = makeRuntimeCopy(makeTempDir('mcp-dynamic-ver-'), '2.4.7-test');
+    const child = spawn(
+      process.execPath,
+      ['--no-warnings', path.join(staged, 'src', 'cli.ts'), 'mcp'],
+      {
+        cwd: staged,
+        env: { ...process.env, CODEX_REVIEW_PORT: '99999' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }
+    );
+
+    try {
+      const response = await new Promise<{ result?: { serverInfo?: { name: string; version: string } } }>(
+        (resolve, reject) => {
+          let buf = '';
+          const timer = setTimeout(() => reject(new Error('MCP initialize timed out')), 5000);
+          child.stdout.on('data', (chunk: Buffer) => {
+            buf += chunk.toString('utf8');
+            const nl = buf.indexOf('\n');
+            if (nl !== -1) {
+              clearTimeout(timer);
+              resolve(JSON.parse(buf.slice(0, nl)) as { result?: { serverInfo?: { name: string; version: string } } });
+            }
+          });
+          child.on('error', (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+          child.stdin.write(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'initialize',
+              params: {
+                protocolVersion: '2024-11-05',
+                capabilities: {},
+                clientInfo: { name: 'version-test', version: '1.0.0' },
+              },
+            }) + '\n'
+          );
+        }
+      );
+      assert.deepEqual(response.result?.serverInfo, {
+        name: 'codex-markup',
+        version: '2.4.7-test',
+      });
+    } finally {
+      child.stdin.end();
+      child.kill('SIGTERM');
+    }
+  });
+
+  it('writes Manifest v2, handles parseArgs flag ordering, and supports doctor/uninstall --json', async () => {
+    const home = makeTempDir('manifest-v2-home-');
+    const nonGitSource = makeRuntimeCopy(makeTempDir('non-git-src-'), '1.5.0');
+    const installOut = await execFileAsync(
+      process.execPath,
+      ['--no-warnings', path.join(nonGitSource, 'src', 'cli.ts'), 'install', '--codex-home', home, '--copy', '--json'],
+      { env: { ...process.env, CODEX_REVIEW_PORT: '99999' } }
+    );
+    const installJson = JSON.parse(installOut.stdout) as {
+      status: string;
+      version: string;
+      managed: boolean;
+      skillScope: string;
+      runtimeSha256: string;
+    };
+    assert.equal(installJson.status, 'verified');
+    assert.equal(installJson.version, '1.5.0');
+    assert.equal(installJson.managed, true);
+    assert.equal(installJson.skillScope, 'codex');
+
+    const manifest = readInstallManifest(path.join(home, 'codex-markup-install.json'));
+    assert.ok(manifest && manifest.schemaVersion === 2);
+    assert.equal(manifest.version, '1.5.0');
+    assert.equal(manifest.managed, true);
+    assert.equal(manifest.sourceCommit, undefined);
+    assert.equal(manifest.runtimeSha256, computeRuntimeSha256(path.join(home, 'tools', 'codex-markup')));
+    assert.equal(manifest.artifacts.skillScope, 'codex');
+    assert.equal(manifest.artifacts.skillDir, path.join(home, 'skills', 'inline-html-review'));
+    assert.ok(manifest.artifacts.skillFiles['SKILL.md']);
+    assert.ok(manifest.artifacts.agentsBlockSha256);
+    assert.ok(manifest.artifacts.configMcpSha256);
+
+    // parseArgs: boolean --json BEFORE subcommand, --flag=value, and -- delimiter
+    const earlyJsonDoctor = await runCli(['--json', 'doctor', `--codex-home=${home}`]);
+    const doctorPayload = JSON.parse(earlyJsonDoctor.stdout) as {
+      ok: boolean;
+      managed: boolean;
+      needsSync: boolean;
+      customizedFiles: string[];
+      checks: Array<{ name: string; status: string }>;
+    };
+    assert.equal(doctorPayload.ok, true);
+    assert.equal(doctorPayload.managed, true);
+    assert.equal(doctorPayload.needsSync, false);
+    assert.deepEqual(doctorPayload.customizedFiles, []);
+    assert.equal(doctorPayload.checks.find((c) => c.name === 'sync-drift')?.status, 'pass');
+    // Isolated --codex-home must never check real ~/.agents for duplicates
+    assert.equal(doctorPayload.checks.some((c) => c.name === 'skill-duplicates'), false);
+
+    // Context-sensitive --json payload on reply-batch and -- delimiter on add-comment
+    const htmlDir = makeTempDir('cli-parse-html-');
+    const htmlFile = makeTempHtml(htmlDir);
+    await runCli(['add-comment', htmlFile, '--', '- leading dash comment']);
+    const batchRes = await runCli([
+      'reply-batch',
+      htmlFile,
+      '--json',
+      JSON.stringify([{ id: 'c-1', reply: 'Handled dash comment', status: 'resolved' }]),
+    ]);
+    assert.match(batchRes.stdout, /Replied to 1 comment\(s\) in batch/);
+    assert.equal(loadReviewState(htmlFile).threads[0].messages[0].text, '- leading dash comment');
+    assert.equal(loadReviewState(htmlFile).threads[0].status, 'resolved');
+
+    const uninstallOut = await runCli(['--json', 'uninstall', '--codex-home', home]);
+    const uninstallJson = JSON.parse(uninstallOut.stdout) as {
+      removedConfigSection: boolean;
+      removedSkillDir: boolean;
+      removedAgentsBlock: boolean;
+      removedRuntimeDir: boolean;
+    };
+    assert.equal(uninstallJson.removedConfigSection, true);
+    assert.equal(uninstallJson.removedSkillDir, true);
+    assert.equal(uninstallJson.removedAgentsBlock, true);
+    assert.equal(uninstallJson.removedRuntimeDir, true);
+  });
+
+  it('syncs recursive skill assets, prunes obsolete files, and preserves managed=false after git pull', async () => {
+    const srcDir = makeRuntimeCopy(makeTempDir('sync-src-'));
+    const copyDst = makeTempDir('sync-copy-dst-');
+    fs.writeFileSync(path.join(srcDir, 'src', 'obsolete.ts'), 'export const old = 1;\n');
+    fs.writeFileSync(path.join(srcDir, 'bin', 'obsolete.js'), 'console.log(1);\n');
+    fs.writeFileSync(path.join(srcDir, 'skills', 'inline-html-review', 'obsolete-skill.md'), 'old\n');
+    fs.mkdirSync(path.join(srcDir, 'skills', 'inline-html-review', 'references'), { recursive: true });
+    fs.writeFileSync(path.join(srcDir, 'skills', 'inline-html-review', 'references', 'guide.md'), '# Guide v1\n');
+
+    copyRuntimeToDir(srcDir, copyDst);
+    assert.equal(fs.existsSync(path.join(copyDst, 'src', 'obsolete.ts')), true);
+    assert.equal(fs.existsSync(path.join(copyDst, 'skills', 'inline-html-review', 'references', 'guide.md')), true);
+
+    fs.unlinkSync(path.join(srcDir, 'src', 'obsolete.ts'));
+    fs.unlinkSync(path.join(srcDir, 'bin', 'obsolete.js'));
+    fs.unlinkSync(path.join(srcDir, 'skills', 'inline-html-review', 'obsolete-skill.md'));
+    copyRuntimeToDir(srcDir, copyDst);
+    assert.equal(fs.existsSync(path.join(copyDst, 'src', 'obsolete.ts')), false);
+    assert.equal(fs.existsSync(path.join(copyDst, 'bin', 'obsolete.js')), false);
+    assert.equal(fs.existsSync(path.join(copyDst, 'skills', 'inline-html-review', 'obsolete-skill.md')), false);
+
+    // Contributor checkout (managed: false) initialized as git repo
+    const home = makeTempDir('sync-contrib-home-');
+    await execFileAsync('git', ['init', '-b', 'main', srcDir]);
+    await execFileAsync('git', ['add', '.'], { cwd: srcDir });
+    await execFileAsync(
+      'git',
+      ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'v1'],
+      { cwd: srcDir }
+    );
+    const commit1 = (await execFileAsync('git', ['-C', srcDir, 'rev-parse', 'HEAD'])).stdout.trim();
+
+    await installForCodex({ sourceRoot: srcDir, codexHome: home, installDir: srcDir, json: true });
+    const manifest1 = readInstallManifest(path.join(home, 'codex-markup-install.json'));
+    assert.ok(manifest1 && manifest1.schemaVersion === 2);
+    assert.equal(manifest1.managed, false);
+    assert.equal(manifest1.sourceCommit, commit1);
+    assert.equal(
+      fs.readFileSync(path.join(home, 'skills', 'inline-html-review', 'references', 'guide.md'), 'utf8'),
+      '# Guide v1\n'
+    );
+
+    // Simulate git pull updating SKILL.md, pruning references/guide.md, adding assets/icon.txt
+    fs.rmSync(path.join(srcDir, 'skills', 'inline-html-review', 'references'), { recursive: true, force: true });
+    fs.mkdirSync(path.join(srcDir, 'skills', 'inline-html-review', 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(srcDir, 'skills', 'inline-html-review', 'assets', 'icon.txt'), 'icon\n');
+    const skillTplPath = path.join(srcDir, 'skills', 'inline-html-review', 'SKILL.md');
+    fs.writeFileSync(skillTplPath, fs.readFileSync(skillTplPath, 'utf8') + '\n<!-- pulled update -->\n');
+    await execFileAsync('git', ['add', '.'], { cwd: srcDir });
+    await execFileAsync(
+      'git',
+      ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'v2'],
+      { cwd: srcDir }
+    );
+    const commit2 = (await execFileAsync('git', ['-C', srcDir, 'rev-parse', 'HEAD'])).stdout.trim();
+
+    const doctorDrift = await runDoctor({ codexHome: home, quiet: true });
+    assert.equal(doctorDrift.ok, true);
+    assert.equal(doctorDrift.needsSync, true);
+    assert.equal(doctorDrift.checks.find((c) => c.name === 'sync-drift')?.status, 'warn');
+
+    const syncOut = await runCli(['sync', '--codex-home', home, '--json']);
+    const syncJson = JSON.parse(syncOut.stdout) as {
+      status: string;
+      managed: boolean;
+      needsSync: boolean;
+      restartRequired: boolean;
+    };
+    assert.equal(syncJson.status, 'synced');
+    assert.equal(syncJson.managed, false);
+    assert.equal(syncJson.needsSync, false);
+    assert.equal(syncJson.restartRequired, true);
+
+    assert.equal(fs.existsSync(path.join(home, 'skills', 'inline-html-review', 'references', 'guide.md')), false);
+    assert.equal(
+      fs.readFileSync(path.join(home, 'skills', 'inline-html-review', 'assets', 'icon.txt'), 'utf8'),
+      'icon\n'
+    );
+    const manifest2 = readInstallManifest(path.join(home, 'codex-markup-install.json'));
+    assert.ok(manifest2 && manifest2.schemaVersion === 2);
+    assert.equal(manifest2.managed, false);
+    assert.equal(manifest2.sourceCommit, commit2);
+
+    const doctorClean = await runDoctor({ codexHome: home, quiet: true });
+    assert.equal(doctorClean.needsSync, false);
+    assert.equal(doctorClean.checks.find((c) => c.name === 'sync-drift')?.status, 'pass');
+
+    // Sync also preserves managed: true on managed installs
+    const managedHome = makeTempDir('sync-managed-home-');
+    await installForCodex({ sourceRoot: srcDir, codexHome: managedHome, copy: true, json: true });
+    fs.unlinkSync(path.join(managedHome, 'skills', 'inline-html-review', 'assets', 'icon.txt'));
+    const managedSync = await syncCodexSetup({ codexHome: managedHome, json: true });
+    assert.equal(managedSync.managed, true);
+    assert.equal(managedSync.status, 'synced');
+    assert.equal(fs.existsSync(path.join(managedHome, 'skills', 'inline-html-review', 'assets', 'icon.txt')), true);
+  });
+
+  it('protects local edits in SKILL.md and AGENTS.md unless --force (CLI + install.sh)', async () => {
+    const home = makeTempDir('user-edit-home-');
+    const skillPath = path.join(home, 'skills', 'inline-html-review', 'SKILL.md');
+    const agentsPath = path.join(home, 'AGENTS.md');
+    fs.writeFileSync(agentsPath, '# Personal Rules\nAlways preserve me.\n', 'utf8');
+
+    await installForCodex({ sourceRoot: REPO_ROOT, codexHome: home, copy: true, json: true });
+
+    // Edit SKILL.md locally
+    fs.appendFileSync(skillPath, '\n<!-- local user customization -->\n');
+    const doctorCustomized = await runDoctor({ codexHome: home, quiet: true });
+    assert.equal(doctorCustomized.ok, true);
+    assert.equal(doctorCustomized.checks.find((c) => c.name === 'sync-drift')?.status, 'warn');
+    assert.ok((doctorCustomized.customizedFiles || []).some((f) => f.endsWith('SKILL.md')));
+
+    await assert.rejects(
+      () => installForCodex({ sourceRoot: REPO_ROOT, codexHome: home, copy: true, json: true }),
+      (err: unknown) => err instanceof UserCustomizationError && err.customizedFiles.some((f) => f.endsWith('SKILL.md'))
+    );
+    await assert.rejects(
+      () => syncCodexSetup({ codexHome: home, json: true }),
+      (err: unknown) => err instanceof UserCustomizationError
+    );
+    const v2Dir = makeRuntimeCopy(makeTempDir('user-edit-v2-'), '1.1.0');
+    await assert.rejects(
+      () => updateInstallation({ codexHome: home, from: v2Dir, json: true }),
+      (err: unknown) => err instanceof UserCustomizationError
+    );
+    // Original customized file and version stayed intact
+    assert.match(fs.readFileSync(skillPath, 'utf8'), /local user customization/);
+    assert.equal(readInstallManifest(path.join(home, 'codex-markup-install.json'))?.schemaVersion, 2);
+
+    // Sync with --force overwrites SKILL.md
+    await syncCodexSetup({ codexHome: home, force: true, json: true });
+    assert.equal(fs.readFileSync(skillPath, 'utf8').includes('local user customization'), false);
+
+    // Edit inside AGENTS.md marker block
+    const agentsBefore = fs.readFileSync(agentsPath, 'utf8');
+    fs.writeFileSync(
+      agentsPath,
+      agentsBefore.replace('<!-- END CODEX-INLINE-REVIEW -->', 'User custom step.\n<!-- END CODEX-INLINE-REVIEW -->'),
+      'utf8'
+    );
+    await assert.rejects(
+      () => syncCodexSetup({ codexHome: home, json: true }),
+      (err: unknown) => err instanceof UserCustomizationError && err.customizedFiles.some((f) => f.endsWith('AGENTS.md'))
+    );
+    await syncCodexSetup({ codexHome: home, force: true, json: true });
+    const agentsAfterForce = fs.readFileSync(agentsPath, 'utf8');
+    assert.match(agentsAfterForce, /# Personal Rules/);
+    assert.equal(agentsAfterForce.includes('User custom step.'), false);
+
+    // install.sh refuses without --force (rolling back cleanly) and succeeds with --force or CODEX_MARKUP_FORCE=1
+    const dir = makeTempDir('sh-force-');
+    const remote = makeRuntimeCopy(path.join(dir, 'remote'));
+    await execFileAsync('git', ['init', '-b', 'main', remote]);
+    await execFileAsync('git', ['add', '.'], { cwd: remote });
+    await execFileAsync(
+      'git',
+      ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'init'],
+      { cwd: remote }
+    );
+    const shHome = path.join(dir, 'home');
+    const shRuntime = path.join(dir, 'runtime');
+    const script = path.join(REPO_ROOT, 'install.sh');
+    const shEnv = {
+      ...process.env,
+      CODEX_HOME: shHome,
+      CODEX_MARKUP_DIR: shRuntime,
+      CODEX_MARKUP_SOURCE_DIR: '',
+      CODEX_MARKUP_REPO: remote,
+      CODEX_REVIEW_PORT: '99999',
+    };
+    await execFileAsync('bash', [script], { env: shEnv });
+    fs.writeFileSync(path.join(shRuntime, 'sentinel'), 'keep-on-reject');
+    const shSkill = path.join(shHome, 'skills', 'inline-html-review', 'SKILL.md');
+    fs.appendFileSync(shSkill, '\n<!-- user shell edit -->\n');
+
+    await assert.rejects(() => execFileAsync('bash', [script], { env: shEnv }));
+    assert.equal(fs.readFileSync(path.join(shRuntime, 'sentinel'), 'utf8'), 'keep-on-reject');
+    assert.match(fs.readFileSync(shSkill, 'utf8'), /user shell edit/);
+
+    await execFileAsync('bash', [script, '--force'], { env: shEnv });
+    assert.equal(fs.existsSync(path.join(shRuntime, 'sentinel')), false);
+    assert.equal(fs.readFileSync(shSkill, 'utf8').includes('user shell edit'), false);
+
+    fs.appendFileSync(shSkill, '\n<!-- user env edit -->\n');
+    await execFileAsync('bash', [script], { env: { ...shEnv, CODEX_MARKUP_FORCE: '1' } });
+    assert.equal(fs.readFileSync(shSkill, 'utf8').includes('user env edit'), false);
+  });
+
+  it('supports opt-in --skill-scope agents with --agents-dir isolation, duplicate warning, and scope switching', async () => {
+    const home = makeTempDir('scope-home-');
+    const agentsDir = makeTempDir('scope-agents-');
+    const codexSkillDir = path.join(home, 'skills', 'inline-html-review');
+    const agentsSkillDir = path.join(agentsDir, 'skills', 'inline-html-review');
+
+    const res = await installForCodex({
+      sourceRoot: REPO_ROOT,
+      codexHome: home,
+      copy: true,
+      skillScope: 'agents',
+      agentsDir,
+      json: true,
+    });
+    assert.equal(res.skillScope, 'agents');
+    assert.equal(res.skillDir, agentsSkillDir);
+    assert.equal(fs.existsSync(path.join(agentsSkillDir, 'SKILL.md')), true);
+    assert.equal(fs.existsSync(codexSkillDir), false);
+
+    const docClean = await runDoctor({ codexHome: home, quiet: true });
+    assert.equal(docClean.ok, true);
+    assert.equal(docClean.skillScope, 'agents');
+    assert.equal(docClean.checks.find((c) => c.name === 'skill-file')?.status, 'pass');
+    assert.equal(docClean.checks.find((c) => c.name === 'skill-duplicates')?.status, 'pass');
+
+    // Duplicate warning when both codex and agents skill directories exist
+    fs.mkdirSync(codexSkillDir, { recursive: true });
+    fs.writeFileSync(path.join(codexSkillDir, 'SKILL.md'), 'duplicate\n', 'utf8');
+    const docDup = await runDoctor({ codexHome: home, quiet: true });
+    assert.equal(docDup.ok, true);
+    assert.equal(docDup.checks.find((c) => c.name === 'skill-duplicates')?.status, 'warn');
+
+    // Switch back to codex scope (with --force because manual duplicate existed in codexSkillDir)
+    await installForCodex({
+      sourceRoot: REPO_ROOT,
+      codexHome: home,
+      copy: true,
+      skillScope: 'codex',
+      force: true,
+      json: true,
+    });
+    assert.equal(fs.existsSync(path.join(codexSkillDir, 'SKILL.md')), true);
+    assert.equal(fs.existsSync(agentsSkillDir), false);
+    // Parent dirs remain intact
+    assert.equal(fs.existsSync(path.join(agentsDir, 'skills')), true);
+
+    // Switch back to agents scope and verify codexSkillDir is cleaned up + uninstall cleans agentsSkillDir
+    await installForCodex({
+      sourceRoot: REPO_ROOT,
+      codexHome: home,
+      copy: true,
+      skillScope: 'agents',
+      agentsDir,
+      json: true,
+    });
+    assert.equal(fs.existsSync(codexSkillDir), false);
+    assert.equal(fs.existsSync(path.join(agentsSkillDir, 'SKILL.md')), true);
+
+    const uninst = uninstallFromCodex({ codexHome: home, json: true });
+    assert.equal(uninst.removedSkillDir, true);
+    assert.equal(fs.existsSync(agentsSkillDir), false);
+    assert.equal(fs.existsSync(path.join(agentsDir, 'skills')), true);
+  });
+
+  it('executes offline update --check/apply, tarball validation, HTTP ETag 304->200, rollbacks, and legacy/v1 compat', async () => {
+    const dir = makeTempDir('update-e2e-');
+    const remote = makeRuntimeCopy(path.join(dir, 'remote'), '1.0.0');
+    await execFileAsync('git', ['init', '-b', 'main', remote]);
+    await execFileAsync('git', ['add', '.'], { cwd: remote });
+    await execFileAsync(
+      'git',
+      ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'v1.0.0'],
+      { cwd: remote }
+    );
+    const c1 = (await execFileAsync('git', ['-C', remote, 'rev-parse', 'HEAD'])).stdout.trim();
+
+    const home = path.join(dir, 'home');
+    const runtime = path.join(dir, 'runtime');
+    await execFileAsync('bash', [path.join(REPO_ROOT, 'install.sh')], {
+      env: {
+        ...process.env,
+        CODEX_HOME: home,
+        CODEX_MARKUP_DIR: runtime,
+        CODEX_MARKUP_SOURCE_DIR: '',
+        CODEX_MARKUP_REPO: remote,
+        CODEX_REVIEW_PORT: '99999',
+      },
+    });
+
+    // 1. Git check up-to-date -> commit v1.1.0 -> check update-available -> apply
+    const check1 = await runCli(['update', '--check', '--codex-home', home, '--json']);
+    const check1Json = JSON.parse(check1.stdout) as { status: string; updateAvailable: boolean };
+    assert.equal(check1Json.status, 'up-to-date');
+    assert.equal(check1Json.updateAvailable, false);
+
+    const pkgPath = path.join(remote, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as Record<string, unknown>;
+    pkg.version = '1.1.0';
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+    await execFileAsync('git', ['add', '.'], { cwd: remote });
+    await execFileAsync(
+      'git',
+      ['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'v1.1.0'],
+      { cwd: remote }
+    );
+    const c2 = (await execFileAsync('git', ['-C', remote, 'rev-parse', 'HEAD'])).stdout.trim();
+
+    const check2 = await runCli(['update', '--check', '--codex-home', home, '--json']);
+    const check2Json = JSON.parse(check2.stdout) as {
+      status: string;
+      updateAvailable: boolean;
+      remoteCommit: string;
+    };
+    assert.equal(check2Json.status, 'update-available');
+    assert.equal(check2Json.updateAvailable, true);
+    assert.equal(check2Json.remoteCommit, c2);
+
+    const applyGit = await runCli(['update', '--codex-home', home, '--json']);
+    const applyGitJson = JSON.parse(applyGit.stdout) as {
+      status: string;
+      previousVersion: string;
+      version: string;
+      previousCommit: string;
+      sourceCommit: string;
+    };
+    assert.equal(applyGitJson.status, 'updated');
+    assert.equal(applyGitJson.previousVersion, '1.0.0');
+    assert.equal(applyGitJson.version, '1.1.0');
+    assert.equal(applyGitJson.previousCommit, c1);
+    assert.equal(applyGitJson.sourceCommit, c2);
+
+    // 2. --from <dir> (non-git) clears stale sourceCommit
+    const v2Dir = makeRuntimeCopy(path.join(dir, 'v2-dir'), '1.2.0');
+    const applyDir = await updateInstallation({ codexHome: home, from: v2Dir, json: true });
+    assert.equal(applyDir.mode, 'apply');
+    assert.equal(applyDir.status, 'updated');
+    assert.equal(applyDir.version, '1.2.0');
+    const afterDirManifest = readInstallManifest(path.join(home, 'codex-markup-install.json'));
+    assert.ok(afterDirManifest && afterDirManifest.schemaVersion === 2);
+    assert.equal(afterDirManifest.sourceCommit, undefined);
+
+    // 3. --from <tgz> local archive
+    const v3Dir = makeRuntimeCopy(path.join(dir, 'v3-dir'), '1.3.0');
+    const v3Tgz = path.join(dir, 'v3.tgz');
+    await execFileAsync('tar', ['-czf', v3Tgz, '-C', dir, 'v3-dir']);
+    const applyTgz = await updateInstallation({ codexHome: home, from: v3Tgz, json: true });
+    assert.equal(applyTgz.mode, 'apply');
+    assert.equal(applyTgz.version, '1.3.0');
+
+    // 4. Reject malicious .tgz archives (traversal, leading /, backslash, drive prefix, symlink, hardlink)
+    const maliciousArchives: Array<[string, Buffer]> = [
+      ['traversal', createUstarTarGz([{ name: 'pkg/../escape.txt', content: 'x' }])],
+      ['abs-path', createUstarTarGz([{ name: '/etc/evil', content: 'x' }])],
+      ['backslash', createUstarTarGz([{ name: 'pkg\\evil.txt', content: 'x' }])],
+      ['drive-prefix', createUstarTarGz([{ name: 'C:evil.txt', content: 'x' }])],
+      ['symlink', createUstarTarGz([{ name: 'pkg/sym', type: 'symlink', linkname: '/etc/passwd' }])],
+      ['hardlink', createUstarTarGz([{ name: 'pkg/a.txt', content: 'hi' }, { name: 'pkg/hard', type: 'hardlink', linkname: 'pkg/a.txt' }])],
+    ];
+    for (const [label, buf] of maliciousArchives) {
+      const badTgz = path.join(dir, `bad-${label}.tgz`);
+      fs.writeFileSync(badTgz, buf);
+      await assert.rejects(
+        () => updateInstallation({ codexHome: home, from: badTgz, json: true }),
+        (err: unknown) => err instanceof Error && /Refusing tarball/i.test(err.message),
+        `Expected ${label} tarball to be rejected`
+      );
+    }
+
+    // 5. Loopback HTTP HEAD If-None-Match 304 -> 200 ETag update
+    const v4Dir = makeRuntimeCopy(path.join(dir, 'v4-dir'), '1.4.0');
+    const v4Tgz = path.join(dir, 'v4.tgz');
+    await execFileAsync('tar', ['-czf', v4Tgz, '-C', dir, 'v4-dir']);
+
+    let currentEtag = '"v3-etag"';
+    let currentTgzBytes = fs.readFileSync(v3Tgz);
+    const seenMethods: string[] = [];
+    const seenIfNoneMatch: Array<string | null> = [];
+    const handleHttpReq = (method: string, ifNoneMatch: string | null) => {
+      seenMethods.push(method);
+      seenIfNoneMatch.push(ifNoneMatch);
+      if (ifNoneMatch === currentEtag) {
+        return { status: 304, headers: { ETag: currentEtag }, body: Buffer.alloc(0) };
+      }
+      return {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/gzip',
+          ETag: currentEtag,
+          'Content-Length': String(currentTgzBytes.byteLength),
+        },
+        body: method === 'HEAD' ? Buffer.alloc(0) : currentTgzBytes,
+      };
+    };
+
+    const httpServer = http.createServer((req, res) => {
+      const reply = handleHttpReq(
+        req.method || 'GET',
+        typeof req.headers['if-none-match'] === 'string' ? req.headers['if-none-match'] : null
+      );
+      res.writeHead(reply.status, reply.headers);
+      res.end(reply.body);
+    });
+
+    let restoreFetch: (() => void) | undefined;
+    let tarballUrl = 'http://127.0.0.1:49999/release.tgz';
+    let serverListening = false;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        httpServer.once('error', reject);
+        httpServer.listen(0, '127.0.0.1', () => {
+          serverListening = true;
+          resolve();
+        });
+      });
+      const addr = httpServer.address();
+      assert.ok(addr && typeof addr === 'object');
+      tarballUrl = `http://127.0.0.1:${addr.port}/release.tgz`;
+      // Probe whether loopback fetch is permitted in this runtime/sandbox
+      await fetch(tarballUrl, { method: 'HEAD' });
+      seenMethods.length = 0;
+      seenIfNoneMatch.length = 0;
+    } catch (probeErr: unknown) {
+      const code =
+        (probeErr as { code?: string; cause?: { code?: string } })?.cause?.code ??
+        (probeErr as { code?: string })?.code;
+      if (code !== 'EPERM') throw probeErr;
+      // Sandbox denies TCP loopback sockets; route fetch through the same handler in-process.
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (urlStr !== tarballUrl) {
+          return realFetch(input, init);
+        }
+        const headers = new Headers(init?.headers);
+        const reply = handleHttpReq(init?.method || 'GET', headers.get('If-None-Match'));
+        return new Response(
+          reply.status === 304 || init?.method === 'HEAD' ? null : new Uint8Array(reply.body),
+          {
+            status: reply.status,
+            headers: reply.headers,
+          }
+        );
+      }) as typeof fetch;
+      restoreFetch = () => {
+        globalThis.fetch = realFetch;
+      };
+    }
+
+    try {
+      const firstHttpUpdate = await updateInstallation({ codexHome: home, tarballUrl, json: true });
+      assert.equal(firstHttpUpdate.mode, 'apply');
+      assert.equal(firstHttpUpdate.version, '1.3.0');
+
+      // Now update --check uses saved tarballUrl + If-None-Match -> 304 up-to-date
+      const httpCheck304 = await updateInstallation({ codexHome: home, check: true, json: true });
+      assert.equal(httpCheck304.mode, 'check');
+      assert.equal(httpCheck304.status, 'up-to-date');
+      assert.equal(httpCheck304.updateAvailable, false);
+      assert.equal(seenMethods.at(-1), 'HEAD');
+      assert.equal(seenIfNoneMatch.at(-1), '"v3-etag"');
+
+      // Flip server ETag and tarball bytes to 1.4.0
+      currentEtag = '"v4-etag"';
+      currentTgzBytes = fs.readFileSync(v4Tgz);
+      const httpCheck200 = await updateInstallation({ codexHome: home, check: true, json: true });
+      assert.equal(httpCheck200.mode, 'check');
+      assert.equal(httpCheck200.status, 'update-available');
+      assert.equal(httpCheck200.remoteEtag, '"v4-etag"');
+      assert.equal(seenMethods.at(-1), 'HEAD');
+      assert.equal(seenIfNoneMatch.at(-1), '"v3-etag"');
+
+      const secondHttpUpdate = await updateInstallation({ codexHome: home, json: true });
+      assert.equal(secondHttpUpdate.mode, 'apply');
+      assert.equal(secondHttpUpdate.version, '1.4.0');
+    } finally {
+      restoreFetch?.();
+      if (serverListening) {
+        await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      }
+    }
+
+    // 6. Rollback on broken cli.ts during verify-home & post-swap registration failure
+    const configSnapshot = fs.readFileSync(path.join(home, 'config.toml'), 'utf8');
+    fs.writeFileSync(path.join(runtime, 'sentinel'), 'preserve-me');
+
+    const brokenVerifyDir = makeRuntimeCopy(path.join(dir, 'broken-verify'), '1.5.0');
+    fs.writeFileSync(path.join(brokenVerifyDir, 'src', 'cli.ts'), 'throw new Error("broken release");\n');
+    await assert.rejects(() => updateInstallation({ codexHome: home, from: brokenVerifyDir, json: true }));
+    assert.equal(fs.readFileSync(path.join(runtime, 'sentinel'), 'utf8'), 'preserve-me');
+    assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), configSnapshot);
+
+    const brokenRegDir = makeRuntimeCopy(path.join(dir, 'broken-reg'), '1.6.0');
+    const origCli = fs.readFileSync(path.join(brokenRegDir, 'src', 'cli.ts'), 'utf8');
+    fs.writeFileSync(
+      path.join(brokenRegDir, 'src', 'cli.ts'),
+      `import failFs from 'node:fs'; if (process.argv.includes(${JSON.stringify(home)})) { failFs.writeFileSync(${JSON.stringify(path.join(home, 'config.toml'))}, 'CORRUPTED_CONFIG'); process.exit(1); }\n` +
+        origCli
+    );
+    await assert.rejects(() => updateInstallation({ codexHome: home, from: brokenRegDir, json: true }));
+    assert.equal(fs.readFileSync(path.join(runtime, 'sentinel'), 'utf8'), 'preserve-me');
+    assert.equal(fs.readFileSync(path.join(home, 'config.toml'), 'utf8'), configSnapshot);
+    const postRollbackDoc = await runDoctor({ codexHome: home, quiet: true });
+    assert.equal(postRollbackDoc.ok, true);
+
+    // 7. Contributor managed=false refusal
+    const contribHome = makeTempDir('contrib-refuse-home-');
+    const contribCheckout = makeRuntimeCopy(makeTempDir('contrib-refuse-src-'));
+    await installForCodex({ sourceRoot: contribCheckout, installDir: contribCheckout, codexHome: contribHome, json: true });
+    assert.equal(readInstallManifest(path.join(contribHome, 'codex-markup-install.json'))?.managed, false);
+    await assert.rejects(
+      () => updateInstallation({ codexHome: contribHome, from: v4Dir, json: true }),
+      (err: unknown) => err instanceof Error && /unmanaged checkout/i.test(err.message)
+    );
+
+    // 8. Forged manifest rejection (no .codex-markup-owned.json inside unowned dir)
+    const forgedHome = makeTempDir('forged-update-home-');
+    const unownedRuntime = makeRuntimeCopy(makeTempDir('unowned-runtime-'));
+    fs.writeFileSync(
+      path.join(forgedHome, 'codex-markup-install.json'),
+      JSON.stringify({ runtimeRoot: unownedRuntime, codexHome: forgedHome, managed: true })
+    );
+    await assert.rejects(
+      () => updateInstallation({ codexHome: forgedHome, from: v4Dir, json: true }),
+      (err: unknown) => err instanceof Error && /unowned runtime directory/i.test(err.message)
+    );
+
+    // 9. v1 & legacy pre-manifest compatibility
+    const v1Home = makeTempDir('v1-compat-home-');
+    await installForCodex({ sourceRoot: REPO_ROOT, codexHome: v1Home, copy: true, json: true });
+    fs.writeFileSync(
+      path.join(v1Home, 'codex-markup-install.json'),
+      JSON.stringify({
+        runtimeRoot: path.join(v1Home, 'tools', 'codex-markup'),
+        codexHome: v1Home,
+        managed: true,
+      })
+    );
+    const v1Doc = await runDoctor({ codexHome: v1Home, quiet: true });
+    assert.equal(v1Doc.ok, true);
+    assert.equal(v1Doc.checks.find((c) => c.name === 'sync-drift')?.status, 'warn');
+    await updateInstallation({ codexHome: v1Home, from: v4Dir, json: true });
+    assert.equal(readInstallManifest(path.join(v1Home, 'codex-markup-install.json'))?.schemaVersion, 2);
+
+    // Legacy pre-manifest (no manifest file & no .codex-markup-owned.json)
+    const legacyHome = makeTempDir('legacy-compat-home-');
+    await installForCodex({ sourceRoot: REPO_ROOT, codexHome: legacyHome, copy: true, json: true });
+    fs.unlinkSync(path.join(legacyHome, 'codex-markup-install.json'));
+    fs.unlinkSync(path.join(legacyHome, 'tools', 'codex-markup', '.codex-markup-owned.json'));
+    const legacyDoc = await runDoctor({ codexHome: legacyHome, quiet: true });
+    assert.equal(legacyDoc.ok, true);
+    assert.equal(legacyDoc.checks.find((c) => c.name === 'sync-drift')?.status, 'warn');
+    const legacySync = await syncCodexSetup({ codexHome: legacyHome, json: true });
+    assert.equal(legacySync.managed, true);
+    assert.equal(readInstallManifest(path.join(legacyHome, 'codex-markup-install.json'))?.schemaVersion, 2);
   });
 });

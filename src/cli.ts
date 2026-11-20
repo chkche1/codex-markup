@@ -13,7 +13,14 @@ import {
   type SandboxCapabilities,
 } from './server.ts';
 import { startMcpServer } from './mcp.ts';
-import { installForCodex, runDoctor, uninstallFromCodex } from './install.ts';
+import {
+  installForCodex,
+  runDoctor,
+  syncCodexSetup,
+  uninstallFromCodex,
+  updateInstallation,
+  type SkillScope,
+} from './install.ts';
 import {
   formatReviewForCodex,
   createThread,
@@ -26,35 +33,91 @@ import {
   type CommentTarget,
 } from './store.ts';
 
+const VALUE_FLAGS = new Set([
+  'port',
+  'sandbox',
+  'model',
+  'codex-home',
+  'install-dir',
+  'skill-scope',
+  'agents-dir',
+  'from',
+  'repo',
+  'branch',
+  'tarball-url',
+  'status',
+  'selector',
+  'tag',
+]);
+
+function detectCommand(argv: string[]): string | undefined {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--') {
+      return argv[i + 1];
+    }
+    if (arg === '-p') {
+      i++;
+      continue;
+    }
+    if (arg === '-h') continue;
+    if (arg.startsWith('--')) {
+      const eqIdx = arg.indexOf('=');
+      const key = eqIdx !== -1 ? arg.slice(2, eqIdx) : arg.slice(2);
+      if (eqIdx === -1 && VALUE_FLAGS.has(key)) {
+        i++;
+      }
+      continue;
+    }
+    return arg;
+  }
+  return undefined;
+}
+
 function parseArgs(argv: string[]) {
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
+  const jsonTakesValue = detectCommand(argv) === 'reply-batch';
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === '--') {
+      positional.push(...argv.slice(i + 1));
+      break;
+    }
     if (arg.startsWith('--')) {
       const eqIdx = arg.indexOf('=');
       if (eqIdx !== -1) {
         flags[arg.slice(2, eqIdx)] = arg.slice(eqIdx + 1);
       } else {
         const key = arg.slice(2);
-        const next = argv[i + 1];
-        if (next && !next.startsWith('-')) {
-          flags[key] = next;
-          i++;
+        if (VALUE_FLAGS.has(key) || (key === 'json' && jsonTakesValue)) {
+          if (i + 1 >= argv.length) {
+            throw new Error(`Missing value for --${key}`);
+          }
+          flags[key] = argv[++i];
         } else {
           flags[key] = true;
         }
       }
     } else if (arg === '-h') {
       flags.help = true;
-    } else if (arg === '-p' && argv[i + 1]) {
+    } else if (arg === '-p') {
+      if (i + 1 >= argv.length) {
+        throw new Error('Missing value for -p');
+      }
       flags.port = argv[++i];
     } else {
       positional.push(arg);
     }
   }
   return { positional, flags };
+}
+
+function parseSkillScope(value: unknown): SkillScope | undefined {
+  if (value === undefined || value === false) return undefined;
+  if (value === 'codex' || value === 'agents') return value;
+  throw new Error(`Invalid --skill-scope "${String(value)}". Expected "codex" or "agents".`);
 }
 
 function printHelp() {
@@ -76,7 +139,9 @@ COMMANDS:
   resolve <file.html> <id>        Mark a comment thread as resolved (--reopen to reopen)
   restart [file.html]             Restart the local review server (and trigger review if file given)
   install                         Configure ~/.codex/config.toml, skill, and AGENTS.md for Codex Desktop & CLI
-  doctor                          Verify Node.js version, Codex config, skill, and MCP server handshake
+  sync                            Refresh skill, AGENTS.md, config.toml, and Manifest v2 from current runtime
+  update                          Check for (--check) or apply self-updates to a managed installation
+  doctor                          Verify Node.js version, Codex config, skill, drift, and MCP handshake
   uninstall                       Remove Codex MCP config, skill, global instructions, and copied runtime
   setup                           Print Codex MCP & Skill configuration instructions
 
@@ -87,9 +152,18 @@ OPTIONS:
   --codex-home <dir>              Custom Codex configuration directory (default: ~/.codex)
   --copy                          Copy runtime to <codex-home>/tools/codex-markup on install
   --install-dir <dir>             Explicit runtime destination directory on install (implies --copy)
-  --json                          JSON payload (reply-batch) or JSON output (install)
+  --skill-scope <codex|agents>    Install skill into <codex-home>/skills (default) or ~/.agents/skills (agents)
+  --agents-dir <dir>              Custom .agents directory for --skill-scope agents (default: ~/.agents)
+  --force                         Overwrite locally customized skill or AGENTS.md files
+  --check                         Check for updates and local drift without modifying files (update)
+  --from <dir|tgz>                Update from a local directory or .tgz archive instead of remote (update)
+  --repo <url>                    Git repository URL for updates (default: origin or GitHub main)
+  --branch <name>                 Git branch for updates (default: main)
+  --tarball-url <url>             HTTP tarball URL for updates and ETag checks
+  --keep-runtime                  Keep copied runtime directory when uninstalling
+  --json                          JSON payload (reply-batch) or JSON output (install, sync, update, doctor, uninstall)
   --stdin                         Read JSON replies array from stdin (reply-batch)
-  --no-verify                     Skip post-install MCP verification in 'install'
+  --no-verify                     Skip post-install/sync/update verification
   --no-open                       Do not automatically open the browser on 'serve'
   -h, --help                      Show this help message
 
@@ -158,9 +232,18 @@ function printSetup() {
 
   console.log(`# Codex Setup for codex-markup
 
-## 1. Add MCP Server to \`~/.codex/config.toml\`
+## 1. Automatic Setup (Recommended)
 
-Add the following block to your \`~/.codex/config.toml\`:
+Run the built-in installer to configure \`~/.codex/config.toml\`, install the skill, update \`~/.codex/AGENTS.md\`, and verify all six MCP tools:
+
+\`\`\`bash
+node --no-warnings "${cliEntry}" install
+\`\`\`
+
+- Pass \`--skill-scope agents\` to install the skill into \`~/.agents/skills/inline-html-review\` instead of \`~/.codex/skills/inline-html-review\`.
+- Run \`sync\` after pulling checkout updates, \`update --check\` / \`update\` for managed installs, and \`doctor\` anytime to verify setup.
+
+## 2. Manual MCP Config (\`~/.codex/config.toml\`)
 
 \`\`\`toml
 [mcp_servers.inline-review]
@@ -168,17 +251,16 @@ command = "node"
 args = ["--no-warnings", "${cliEntry}", "mcp"]
 \`\`\`
 
-## 2. Or Run Codex with One-Line Config Override
+## 3. Or Run Codex with One-Line Config Override
 
 \`\`\`bash
 codex -c 'mcp_servers.inline-review.command="node"' \\
       -c 'mcp_servers.inline-review.args=["--no-warnings", "${cliEntry}", "mcp"]'
 \`\`\`
 
-## 3. Codex Skill / AGENTS.md Integration
+## 4. Source Skill Template
 
-- Skill path: \`${skillPath}\`
-- Or copy \`AGENTS.md\` into your workspace so Codex automatically knows how to open HTML previews, wait for your inline comments, edit the HTML, and reply to each comment thread!
+- Skill template: \`${skillPath}\`
 `);
 }
 
@@ -210,19 +292,70 @@ async function main() {
   if (cmd === 'install') {
     const customDir = typeof flags['codex-home'] === 'string' ? flags['codex-home'] : undefined;
     const installDir = typeof flags['install-dir'] === 'string' ? flags['install-dir'] : undefined;
+    const agentsDir = typeof flags['agents-dir'] === 'string' ? flags['agents-dir'] : undefined;
     await installForCodex({
       codexHome: customDir,
       copy: Boolean(flags.copy),
       installDir,
       skipVerify: Boolean(flags['no-verify']),
       json: Boolean(flags.json),
+      skillScope: parseSkillScope(flags['skill-scope']),
+      agentsDir,
+      force: Boolean(flags.force),
     });
+    return;
+  }
+
+  if (cmd === 'sync') {
+    const customDir = typeof flags['codex-home'] === 'string' ? flags['codex-home'] : undefined;
+    const agentsDir = typeof flags['agents-dir'] === 'string' ? flags['agents-dir'] : undefined;
+    const result = await syncCodexSetup({
+      codexHome: customDir,
+      skillScope: parseSkillScope(flags['skill-scope']),
+      agentsDir,
+      force: Boolean(flags.force),
+      skipVerify: Boolean(flags['no-verify']),
+      json: Boolean(flags.json),
+    });
+    if (flags.json) {
+      console.log(JSON.stringify(result));
+    }
+    return;
+  }
+
+  if (cmd === 'update') {
+    const customDir = typeof flags['codex-home'] === 'string' ? flags['codex-home'] : undefined;
+    const agentsDir = typeof flags['agents-dir'] === 'string' ? flags['agents-dir'] : undefined;
+    const result = await updateInstallation({
+      codexHome: customDir,
+      check: Boolean(flags.check),
+      from: typeof flags.from === 'string' ? flags.from : undefined,
+      repo: typeof flags.repo === 'string' ? flags.repo : undefined,
+      branch: typeof flags.branch === 'string' ? flags.branch : undefined,
+      tarballUrl: typeof flags['tarball-url'] === 'string' ? flags['tarball-url'] : undefined,
+      force: Boolean(flags.force),
+      skipVerify: Boolean(flags['no-verify']),
+      json: Boolean(flags.json),
+      skillScope: parseSkillScope(flags['skill-scope']),
+      agentsDir,
+    });
+    if (flags.json) {
+      console.log(JSON.stringify(result));
+    }
     return;
   }
 
   if (cmd === 'doctor') {
     const customDir = typeof flags['codex-home'] === 'string' ? flags['codex-home'] : undefined;
-    const report = await runDoctor({ codexHome: customDir });
+    const agentsDir = typeof flags['agents-dir'] === 'string' ? flags['agents-dir'] : undefined;
+    const report = await runDoctor({
+      codexHome: customDir,
+      agentsDir,
+      json: Boolean(flags.json),
+    });
+    if (flags.json) {
+      console.log(JSON.stringify(report));
+    }
     if (!report.ok) {
       process.exit(1);
     }
@@ -231,10 +364,16 @@ async function main() {
 
   if (cmd === 'uninstall') {
     const customDir = typeof flags['codex-home'] === 'string' ? flags['codex-home'] : undefined;
-    uninstallFromCodex({
+    const agentsDir = typeof flags['agents-dir'] === 'string' ? flags['agents-dir'] : undefined;
+    const result = uninstallFromCodex({
       codexHome: customDir,
       keepRuntime: Boolean(flags['keep-runtime']),
+      agentsDir,
+      json: Boolean(flags.json),
     });
+    if (flags.json) {
+      console.log(JSON.stringify(result));
+    }
     return;
   }
 

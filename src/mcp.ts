@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import {
   DEFAULT_PORT,
@@ -176,6 +177,17 @@ const TOOLS = [
     },
   },
 ];
+
+/** Reads the package version from package.json with a safe fallback. */
+export function readServerVersion(): string {
+  try {
+    const pkgPath = path.resolve(import.meta.dirname || '.', '..', 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { version?: unknown };
+    return typeof pkg.version === 'string' && pkg.version.trim() ? pkg.version.trim() : '1.0.0';
+  } catch {
+    return '1.0.0';
+  }
+}
 
 export async function startMcpServer(port = DEFAULT_PORT): Promise<void> {
   let framingMode: 'line' | 'content-length' = 'line';
@@ -426,7 +438,7 @@ export async function startMcpServer(port = DEFAULT_PORT): Promise<void> {
         },
         serverInfo: {
           name: 'codex-markup',
-          version: '1.0.0',
+          version: readServerVersion(),
         },
       });
       return;
